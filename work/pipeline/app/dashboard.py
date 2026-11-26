@@ -140,10 +140,12 @@ tbody tr:hover { background: #f8fafc; }
   white-space: nowrap;
 }
 .badge-matched, .badge-done, .badge-completed { background: var(--ok-bg); color: var(--ok-fg); }
-.badge-needs_review, .badge-queued_discogs, .badge-queued_agent, .badge-queued { background: var(--warn-bg); color: var(--warn-fg); }
-.badge-checking_discogs, .badge-checking_agent, .badge-running { background: #dbeafe; color: #1e40af; }
+.badge-needs_review, .badge-queued_discogs, .badge-queued_agent, .badge-queued_enrich, .badge-queued { background: var(--warn-bg); color: var(--warn-fg); }
+.badge-checking_discogs, .badge-checking_agent, .badge-checking_enrich, .badge-running { background: #dbeafe; color: #1e40af; }
 .badge-not_found, .badge-rejected, .badge-cancelled { background: var(--err-bg); color: var(--err-fg); }
 .badge-other { background: var(--neutral-bg); color: var(--neutral-fg); }
+.src-tag { font-size: 0.72rem; color: var(--muted); margin-left: 4px; white-space: nowrap; }
+.note-sub { font-size: 0.75rem; color: var(--warn-fg); margin-top: 2px; }
 .queue-banner {
   background: var(--card);
   border: 1px solid var(--border);
@@ -209,23 +211,61 @@ def _is_safe_http_url(url: str | None) -> bool:
     return lowered.startswith("http://") or lowered.startswith("https://")
 
 
-def _format_duration(track: TrackOut) -> str:
+def _format_release_label(
+    release_id: int, source: str | None = None, url: str | None = None
+) -> str:
+    if release_id > 0:
+        return f"#{release_id}"
+    src = (source or "").lower()
+    u = (url or "").lower()
+    if "jpc" in src or "jpc.de" in u:
+        return "JPC"
+    if "itunes" in src or "apple.com" in u:
+        return "iTunes"
+    return "External"
+
+
+def _provenance_tag(source: str, url: str = "", primary_provider: str = "") -> str:
+    src = (source or "").strip()
+    if not src:
+        return ""
+    if primary_provider and src == primary_provider:
+        return ""
+    if _is_safe_http_url(url):
+        return f'<a class="src-tag" href="{escape(url)}" target="_blank" rel="noopener">[{escape(src)}]</a>'
+    return f'<span class="src-tag">[{escape(src)}]</span>'
+
+
+def _format_duration(track: TrackOut, primary_provider: str = "") -> str:
     if track.duration_raw:
-        return escape(track.duration_raw)
-    if track.duration_sec is not None:
+        base = escape(track.duration_raw)
+    elif track.duration_sec is not None:
         mins, secs = divmod(track.duration_sec, 60)
-        return f"{mins}:{secs:02d}"
-    return "—"
+        base = f"{mins}:{secs:02d}"
+    else:
+        return "—"
+    return base + _provenance_tag(track.duration_source, track.duration_source_url, primary_provider)
 
 
-def _format_credits(credits: list[dict[str, Any]]) -> str:
+def _format_credits(credits: list[Any], primary_provider: str = "") -> str:
     if not credits:
         return "—"
     parts = []
     for c in credits:
-        name = escape(str(c.get("artist_name") or ""))
-        role = escape(str(c.get("role_raw") or ""))
-        parts.append(f"{name} ({role})" if role else name)
+        if isinstance(c, dict):
+            name = escape(str(c.get("artist_name") or ""))
+            role = escape(str(c.get("role_raw") or ""))
+            c_src = str(c.get("credit_source") or "")
+            c_url = str(c.get("source_url") or "")
+        else:
+            name = escape(str(getattr(c, "artist_name", "") or ""))
+            role = escape(str(getattr(c, "role_raw", "") or ""))
+            c_src = str(getattr(c, "credit_source", "") or "")
+            c_url = str(getattr(c, "source_url", "") or "")
+        text = f"{name} ({role})" if role else name
+        if c_src and c_src not in {"track", "release_all", "release_range", primary_provider}:
+            text += _provenance_tag(c_src, c_url, primary_provider)
+        parts.append(text)
     return ", ".join(parts)
 
 
@@ -241,11 +281,16 @@ def render_results_table(records: list[RecordSummaryOut]) -> str:
     for r in records:
         status_str = r.latest_status or "unknown"
         if r.selected_release_id and r.selected_release_url:
+            rel_label = _format_release_label(
+                r.selected_release_id, r.latest_source, r.selected_release_url
+            )
             release_cell = (
-                f'<a href="{escape(r.selected_release_url)}" target="_blank" rel="noopener">#{r.selected_release_id}</a>'
+                f'<a href="{escape(r.selected_release_url)}" target="_blank" rel="noopener">{escape(rel_label)}</a>'
             )
         elif r.selected_release_id:
-            release_cell = f"#{r.selected_release_id}"
+            release_cell = escape(
+                _format_release_label(r.selected_release_id, r.latest_source)
+            )
         elif r.selected_agent_fallback_id:
             if _is_safe_http_url(r.agent_source_url):
                 release_cell = (
@@ -336,6 +381,11 @@ def render_results_table(records: list[RecordSummaryOut]) -> str:
         <option value="rejected">rejected</option>
       </select>
       <button class="btn" onclick="location.reload()">Refresh</button>
+      <button class="btn btn-confirm" onclick="enqueueEnrichMissing()">Enrich Missing Data</button>
+      <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:0.25rem;"><input id="enrichMissingUseAgent" type="checkbox" checked /> Allow Gemini</label>
+      <button class="btn btn-deny" id="restartDemoBtn" onclick="restartDemo()">Restart 25 Songs</button>
+      <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:0.25rem;" title="Also wipe cached HTTP API responses (slower live network calls)"><input id="restartClearCache" type="checkbox" /> Clear API Cache</label>
+      <span id="toolbarMsg" class="muted-note"></span>
     </div>
 
     <div class="card">
@@ -408,6 +458,52 @@ def render_results_table(records: list[RecordSummaryOut]) -> str:
       }}
     }}
 
+    async function enqueueEnrichMissing() {{
+      const msgEl = document.getElementById("toolbarMsg");
+      const useAgent = Boolean(document.getElementById("enrichMissingUseAgent")?.checked);
+      const res = await fetch("/jobs/enrich-missing", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ use_agent: useAgent, force_refresh: true }})
+      }});
+      const data = await res.json().catch(() => ({{}}));
+      if (res.ok) {{
+        msgEl.textContent = data.total_items
+          ? `Enqueued enrichment job #${{data.id}} (${{data.total_items}} records)`
+          : "No un-enriched records with missing fields.";
+        pollQueueBanner();
+      }} else {{
+        msgEl.textContent = data.detail || "Failed to enqueue enrichment.";
+      }}
+    }}
+
+    async function restartDemo() {{
+      const clearCache = Boolean(document.getElementById("restartClearCache")?.checked);
+      const cacheNote = clearCache ? " AND clear cached HTTP API responses" : " (keeping cached API responses for smooth live replay)";
+      if (!confirm(`Reset all current records/jobs${{cacheNote}} and reload all 25 songs into the live queue?`)) return;
+      const btn = document.getElementById("restartDemoBtn");
+      const msgEl = document.getElementById("toolbarMsg");
+      if (btn) btn.disabled = true;
+      msgEl.textContent = "Resetting DB & queuing 25 songs...";
+      try {{
+        const res = await fetch("/jobs/restart-demo", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ clear_api_cache: clearCache }})
+        }});
+        const data = await res.json().catch(() => ({{}}));
+        if (res.ok) {{
+          window.location.href = `/queue?job=${{data.id}}`;
+        }} else {{
+          msgEl.textContent = data.detail || "Failed to restart 25 songs.";
+          if (btn) btn.disabled = false;
+        }}
+      }} catch (_e) {{
+        msgEl.textContent = "Network error while restarting.";
+        if (btn) btn.disabled = false;
+      }}
+    }}
+
     async function pollQueueBanner() {{
       const banner = document.getElementById("queueBanner");
       const textEl = document.getElementById("queueBannerText");
@@ -416,18 +512,18 @@ def render_results_table(records: list[RecordSummaryOut]) -> str:
         if (!res.ok) return;
         const data = await res.json();
         const c = data.counts || {{}};
-        const activeCount = (c.checking_discogs || 0) + (c.checking_agent || 0);
-        const queuedCount = (c.queued_discogs || 0) + (c.queued_agent || 0);
+        const activeCount = (c.checking_discogs || 0) + (c.checking_agent || 0) + (c.checking_enrich || 0);
+        const queuedCount = (c.queued_discogs || 0) + (c.queued_agent || 0) + (c.queued_enrich || 0);
         if (activeCount > 0 || queuedCount > 0) {{
           banner.classList.add("active");
           const currentNames = (data.active_items || []).slice(0, 3).map(
             (i) => `${{escHtml(i.worker_name || i.stage)}}: ${{escHtml(i.album_artist)}} - ${{escHtml(i.album_title)}}`
           );
           const suffix = currentNames.length ? ` (${{currentNames.join(" | ")}})` : "";
-          textEl.innerHTML = `<strong>Queue Active:</strong> ${{c.checking_discogs || 0}} checking Discogs, ${{c.checking_agent || 0}} checking Agent, ${{queuedCount}} queued${{suffix}}`;
+          textEl.innerHTML = `<strong>Queue Active:</strong> ${{c.checking_discogs || 0}} Discogs, ${{c.checking_agent || 0}} Agent, ${{c.checking_enrich || 0}} Enrich, ${{queuedCount}} queued${{suffix}}`;
         }} else {{
           banner.classList.remove("active");
-          textEl.textContent = `Queue idle (${{data.discogs_workers || 0}} Discogs worker, ${{data.agent_workers || 0}} Agent workers)`;
+          textEl.textContent = `Queue idle (D:${{data.discogs_workers || 0}} A:${{data.agent_workers || 0}} E:${{data.enrich_workers || 0}})`;
         }}
       }} catch (_e) {{}}
     }}
@@ -449,9 +545,10 @@ def render_record_detail(detail: RecordDetailOut) -> str:
         formats_str = ", ".join(
             str(f.get("name", "")) for f in rel.formats if f.get("name")
         ) or "—"
+        rel_label = _format_release_label(rel.discogs_release_id, rec.latest_source, rel.url)
         release_html = f"""
         <div class="card meta-grid">
-          <div class="meta-item"><div class="label">Release</div><div class="val"><a href="{escape(rel.url)}" target="_blank" rel="noopener">#{rel.discogs_release_id} — {escape(rel.title)}</a></div></div>
+          <div class="meta-item"><div class="label">Release</div><div class="val"><a href="{escape(rel.url)}" target="_blank" rel="noopener">{escape(rel_label)} — {escape(rel.title)}</a></div></div>
           <div class="meta-item"><div class="label">Artist</div><div class="val">{escape(rel.artist_display or '—')}</div></div>
           <div class="meta-item"><div class="label">Year / Country</div><div class="val">{escape(str(rel.year or '—'))} / {escape(rel.country or '—')}</div></div>
           <div class="meta-item"><div class="label">Formats</div><div class="val">{escape(formats_str)}</div></div>
@@ -480,36 +577,69 @@ def render_record_detail(detail: RecordDetailOut) -> str:
     else:
         release_html = '<div class="card empty">No release selected.</div>'
 
+    primary_provider = ""
+    if rel is not None:
+        if rel.discogs_release_id > 0:
+            primary_provider = "discogs"
+        elif "jpc" in (rec.latest_source or "").lower() or "jpc.de" in rel.url.lower():
+            primary_provider = "jpc"
+        elif "itunes" in (rec.latest_source or "").lower() or "apple.com" in rel.url.lower():
+            primary_provider = "itunes"
+    elif agent_fb is not None:
+        primary_provider = "gemini_agent"
+
     track_rows = []
     for t in detail.tracks:
-        writers = _format_credits(t.credits.get("writers", []))
-        producers = _format_credits(t.credits.get("producers", []))
+        writers_list = list(t.credits.get("composers", [])) + list(t.credits.get("lyricists", []))
+        writers = _format_credits(writers_list, primary_provider=primary_provider)
+        producers = _format_credits(t.credits.get("producers", []), primary_provider=primary_provider)
+        featured = _format_credits(t.credits.get("featured", []), primary_provider=primary_provider)
+        perf_cell = (
+            escape(t.performing_artist_display)
+            + _provenance_tag(t.performer_source, t.performer_source_url, primary_provider)
+            if t.performing_artist_display
+            else "—"
+        )
+        isrc_cell = (
+            f'<span class="mono">{escape(t.isrc)}</span>'
+            + _provenance_tag(t.isrc_source, t.isrc_source_url, primary_provider)
+            if t.isrc
+            else "—"
+        )
+        notes_html = (
+            "".join(f'<div class="note-sub">{escape(n)}</div>' for n in t.enrichment_notes)
+            if t.enrichment_notes
+            else ""
+        )
         track_rows.append(
             f"<tr>"
             f'<td class="mono">{t.disc_number}</td>'
             f'<td class="mono">{escape(t.position or str(t.track_order))}</td>'
-            f"<td>{escape(t.title)}</td>"
-            f"<td>{escape(t.performing_artist_display or '—')}</td>"
-            f'<td class="mono">{_format_duration(t)}</td>'
+            f"<td>{escape(t.title)}{notes_html}</td>"
+            f"<td>{perf_cell}</td>"
+            f'<td class="mono">{_format_duration(t, primary_provider=primary_provider)}</td>'
+            f"<td>{isrc_cell}</td>"
             f"<td>{writers}</td>"
             f"<td>{producers}</td>"
+            f"<td>{featured}</td>"
             f"</tr>"
         )
     tracks_body = (
         "\n".join(track_rows)
         if track_rows
-        else '<tr><td colspan="7" class="empty">No tracks extracted.</td></tr>'
+        else '<tr><td colspan="9" class="empty">No tracks extracted.</td></tr>'
     )
 
     match_rows = []
     for m in detail.matches:
         sel_mark = "✓" if m.get("is_selected") else ""
         rid = int(m["discogs_release_id"])
+        m_label = _format_release_label(rid, str(m.get("match_method") or ""), str(m.get("url") or ""))
         match_rows.append(
             f"<tr>"
             f'<td class="mono">{escape(str(m.get("match_rank", "")))}</td>'
             f"<td>{sel_mark}</td>"
-            f'<td class="mono"><a href="{escape(str(m.get("url", "")))}" target="_blank" rel="noopener">#{rid}</a></td>'
+            f'<td class="mono"><a href="{escape(str(m.get("url", "")))}" target="_blank" rel="noopener">{escape(m_label)}</a></td>'
             f"<td>{escape(str(m.get('title', '')))}</td>"
             f"<td>{escape(str(m.get('artist_display', '')))}</td>"
             f'<td class="mono">{escape(str(m.get("match_method", "")))}</td>'
@@ -526,7 +656,7 @@ def render_record_detail(detail: RecordDetailOut) -> str:
     review_rows = []
     for rv in detail.reviews:
         if rv.selected_release_id:
-            rel_str = f"#{rv.selected_release_id}"
+            rel_str = _format_release_label(rv.selected_release_id, rec.latest_source)
         elif rv.selected_agent_fallback_id:
             rel_str = f"Agent #{rv.selected_agent_fallback_id}"
         else:
@@ -588,6 +718,7 @@ def render_record_detail(detail: RecordDetailOut) -> str:
       <button class="btn btn-confirm" onclick="submitReview('confirm', null)" {confirm_disabled}>Confirm Match</button>
       <button class="btn btn-deny" onclick="submitReview('deny', null)">Deny / Reject</button>
       <button class="btn btn-review" onclick="submitReview('request_review', null)">Trigger Review</button>
+      {"" if not has_selected else '<button class="btn" onclick="enqueueEnrich()">Enrich Missing Tracks</button><label style="font-size:0.84rem;"><input id="enrichUseAgent" type="checkbox" checked /> Allow Gemini</label>'}
       {"" if (rec.latest_status not in {"not_found", "rejected"}) else '<button class="btn" onclick="enqueueAgentFallback()">Enqueue Agent Fallback</button>'}
       <div id="reviewError" class="review-error"></div>
     </div>
@@ -605,8 +736,10 @@ def render_record_detail(detail: RecordDetailOut) -> str:
             <th>Title</th>
             <th>Performing Artists</th>
             <th>Duration</th>
+            <th>ISRC</th>
             <th>Writers</th>
             <th>Producers</th>
+            <th>Featured</th>
           </tr>
         </thead>
         <tbody>{tracks_body}</tbody>
@@ -686,6 +819,24 @@ def render_record_detail(detail: RecordDetailOut) -> str:
         errBox.style.display = "block";
       }}
     }}
+
+    async function enqueueEnrich() {{
+      const errBox = document.getElementById("reviewError");
+      errBox.style.display = "none";
+      const useAgent = Boolean(document.getElementById("enrichUseAgent")?.checked);
+      const res = await fetch("/jobs/enrich/{rec.input_id}", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ use_agent: useAgent, force_refresh: true }})
+      }});
+      if (res.ok) {{
+        window.location.href = "/queue";
+      }} else {{
+        const data = await res.json().catch(() => ({{}}));
+        errBox.textContent = data.detail || "Failed to enqueue track enrichment.";
+        errBox.style.display = "block";
+      }}
+    }}
   </script>
 </body>
 </html>"""
@@ -715,14 +866,20 @@ _QUEUE_HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="stat"><div class="stat-label">Queued Discogs</div><div class="stat-val" id="statQueuedDiscogs">0</div></div>
       <div class="stat"><div class="stat-label">Active Agent</div><div class="stat-val" id="statActiveAgent">0</div></div>
       <div class="stat"><div class="stat-label">Queued Agent</div><div class="stat-val" id="statQueuedAgent">0</div></div>
+      <div class="stat"><div class="stat-label">Active Enrich</div><div class="stat-val" id="statActiveEnrich">0</div></div>
+      <div class="stat"><div class="stat-label">Queued Enrich</div><div class="stat-val" id="statQueuedEnrich">0</div></div>
       <div class="stat"><div class="stat-label">Worker Pool</div><div class="stat-val" id="statWorkers" style="font-size:0.95rem;">—</div></div>
     </div>
 
     <div class="toolbar">
-      <button class="btn" id="pollToggleBtn" onclick="togglePolling()">Pause Auto-Poll (2s)</button>
+      <button class="btn" id="pollToggleBtn" onclick="togglePolling()">Pause Auto-Poll (1s)</button>
       <button class="btn" onclick="pollStatus()">Refresh Now</button>
       <button class="btn btn-review" id="retryAllBtn" onclick="retryNotFound()">Retry All not_found with Agent</button>
-      <span class="muted-note" id="pollMeta">Auto-polling every 2s</span>
+      <button class="btn btn-confirm" id="enrichMissingBtn" onclick="enqueueEnrichMissing()">Enrich Missing Tracks</button>
+      <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:0.25rem;"><input id="enrichMissingUseAgent" type="checkbox" checked /> Allow Gemini</label>
+      <button class="btn btn-deny" id="restartDemoBtn" onclick="restartDemo()">Restart 25 Songs</button>
+      <label style="font-size:0.84rem; display:inline-flex; align-items:center; gap:0.25rem;" title="Also wipe cached HTTP API responses (slower live network calls)"><input id="restartClearCache" type="checkbox" /> Clear API Cache</label>
+      <span class="muted-note" id="pollMeta">Auto-polling every 1s</span>
       <span class="muted-note" id="actionMsg"></span>
     </div>
 
@@ -842,7 +999,9 @@ _QUEUE_HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById("statQueuedDiscogs").textContent = c.queued_discogs ?? 0;
       document.getElementById("statActiveAgent").textContent = c.checking_agent ?? 0;
       document.getElementById("statQueuedAgent").textContent = c.queued_agent ?? 0;
-      const poolText = `${data.workers_running ? "running" : "stopped"} | D:${data.discogs_workers} A:${data.agent_workers} | Agent:${data.agent_configured ? "on" : "off"}`;
+      document.getElementById("statActiveEnrich").textContent = c.checking_enrich ?? 0;
+      document.getElementById("statQueuedEnrich").textContent = c.queued_enrich ?? 0;
+      const poolText = `${data.workers_running ? "running" : "stopped"} | D:${data.discogs_workers} A:${data.agent_workers} E:${data.enrich_workers ?? 0} | Agent:${data.agent_configured ? "on" : "off"} | Idle:${data.idle_auto_enrichment_enabled ? "on" : "off"}`;
       document.getElementById("statWorkers").textContent = poolText;
       document.getElementById("retryAllBtn").disabled = !data.agent_configured;
 
@@ -929,13 +1088,19 @@ _QUEUE_HTML_TEMPLATE = """<!DOCTYPE html>
       paused = !paused;
       document.getElementById("pollToggleBtn").textContent = paused
         ? "Resume Auto-Poll"
-        : "Pause Auto-Poll (2s)";
+        : "Pause Auto-Poll (1s)";
       if (!paused) pollStatus();
     }
 
     async function loadJobDetail(jobId) {
       const res = await fetch(`/jobs/${jobId}`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        if (res.status === 404) {
+          selectedJobId = null;
+          document.getElementById("jobDetailPanel").style.display = "none";
+        }
+        return;
+      }
       const detail = await res.json();
       document.getElementById("jobDetailPanel").style.display = "block";
       document.getElementById("jobDetailHeading").textContent =
@@ -978,6 +1143,25 @@ _QUEUE_HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    async function enqueueEnrichMissing() {
+      const msgEl = document.getElementById("actionMsg");
+      const useAgent = Boolean(document.getElementById("enrichMissingUseAgent")?.checked);
+      const res = await fetch("/jobs/enrich-missing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ use_agent: useAgent, force_refresh: true })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        msgEl.textContent = data.total_items
+          ? `Enqueued Enrich Job #${data.id} (${data.total_items} records)`
+          : "No un-enriched records need backfill";
+        await pollStatus();
+      } else {
+        msgEl.textContent = data.detail || "Failed to enqueue enrichment job";
+      }
+    }
+
     async function enqueueSingle(ev) {
       ev.preventDefault();
       const msgEl = document.getElementById("actionMsg");
@@ -1004,8 +1188,43 @@ _QUEUE_HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    async function restartDemo() {
+      const clearCache = Boolean(document.getElementById("restartClearCache")?.checked);
+      const cacheNote = clearCache ? " AND clear cached HTTP API responses" : " (keeping cached API responses for smooth live replay)";
+      if (!confirm(`Reset all current records/jobs${cacheNote} and reload all 25 songs into the live queue?`)) return;
+      const btn = document.getElementById("restartDemoBtn");
+      const msgEl = document.getElementById("actionMsg");
+      if (btn) btn.disabled = true;
+      msgEl.textContent = "Resetting DB & queuing 25 songs...";
+      try {
+        const res = await fetch("/jobs/restart-demo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clear_api_cache: clearCache })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          selectedJobId = data.id;
+          if (paused) togglePolling();
+          msgEl.textContent = `Restarted! Queued Job #${data.id} (${data.total_items} songs)`;
+          await pollStatus();
+        } else {
+          msgEl.textContent = data.detail || "Failed to restart 25 songs";
+        }
+      } catch (_e) {
+        msgEl.textContent = "Network error while restarting";
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
     renderStatus(INITIAL_STATUS);
-    setInterval(() => { if (!paused) pollStatus(); }, 2000);
+    const jobParam = new URLSearchParams(window.location.search).get("job");
+    if (jobParam && /^\\d+$/.test(jobParam) && Number(jobParam) > 0) {
+      selectedJobId = Number(jobParam);
+      loadJobDetail(selectedJobId);
+    }
+    setInterval(() => { if (!paused) pollStatus(); }, 1000);
   </script>
 </body>
 </html>"""

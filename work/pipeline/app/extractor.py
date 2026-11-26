@@ -32,6 +32,22 @@ CREDIT_BUCKETS = {
     "other": "other",
 }
 
+UNRESOLVED_ARTIST_NAMES = {
+    "various",
+    "various artists",
+    "va",
+    "v.a.",
+    "verschiedene interpret:innen",
+    "verschiedene interpreten",
+    "unknown",
+    "unknown artist",
+}
+
+
+def is_resolved_artist_name(name: str) -> bool:
+    cleaned = (name or "").strip().lower()
+    return bool(cleaned) and cleaned not in UNRESOLVED_ARTIST_NAMES
+
 
 @dataclass
 class ExtractedCredit:
@@ -41,6 +57,7 @@ class ExtractedCredit:
     role_raw: str
     role_category: str
     credit_source: str
+    source_url: str = ""
 
 
 @dataclass
@@ -59,6 +76,14 @@ class ExtractedTrack:
     has_valid_duration: bool
     has_resolved_performer: bool
     credits: list[ExtractedCredit] = field(default_factory=list)
+    isrc: str = ""
+    isrc_source: str = ""
+    isrc_source_url: str = ""
+    duration_source: str = ""
+    duration_source_url: str = ""
+    performer_source: str = ""
+    performer_source_url: str = ""
+    enrichment_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +112,7 @@ class ExtractedRelease:
     raw_json: dict[str, Any]
     barcode_entries: list[tuple[str, str]]
     tracks: list[ExtractedTrack]
+    source_provider: str = "discogs"
 
 
 def parse_duration_seconds(duration_raw: str) -> int | None:
@@ -102,6 +128,17 @@ def parse_duration_seconds(duration_raw: str) -> int | None:
     if seconds >= 60:
         return None
     return hours * 3600 + minutes * 60 + seconds
+
+
+def format_duration_raw(duration_sec: int | None) -> str:
+    if duration_sec is None or duration_sec < 0:
+        return ""
+    if duration_sec >= 3600:
+        hours, rem = divmod(duration_sec, 3600)
+        mins, secs = divmod(rem, 60)
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    mins, secs = divmod(duration_sec, 60)
+    return f"{mins}:{secs:02d}"
 
 
 def split_roles(role_raw: str) -> list[str]:
@@ -168,7 +205,7 @@ def format_artists(
                 )
             )
             display_name = anv or name_clean
-            if display_name.lower() not in {"various", "various artists", "unknown", "unknown artist"}:
+            if is_resolved_artist_name(display_name):
                 resolved = True
             chunks.append(display_name)
             if idx < len(raw_artists) - 1:
@@ -212,7 +249,7 @@ def _infer_disc_from_position(
 
 
 def _parse_extraartist_credits(
-    entries: list[dict[str, Any]], credit_source: str
+    entries: list[dict[str, Any]], credit_source: str, source_url: str = ""
 ) -> list[ExtractedCredit]:
     credits: list[ExtractedCredit] = []
     for entry in entries or []:
@@ -231,6 +268,7 @@ def _parse_extraartist_credits(
                     role_raw=role_part,
                     role_category=classify_role(role_part),
                     credit_source=credit_source,
+                    source_url=source_url,
                 )
             )
     return credits
@@ -306,7 +344,14 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
     if (
         len(release_artists) == 1
         and strip_discogs_disambiguator(release_artists[0].name).lower()
-        in {"various", "various artists"}
+        in {
+            "various",
+            "various artists",
+            "va",
+            "v.a.",
+            "verschiedene interpret:innen",
+            "verschiedene interpreten",
+        }
     ):
         artist_norm = "various"
     else:
@@ -334,6 +379,8 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
             for variant in barcode_variants(norm_val):
                 barcode_entries_map.setdefault(variant, raw_val)
     barcode_entries = list(barcode_entries_map.items())
+
+    source_provider = str(raw_json.get("_source_provider") or "discogs")
 
     tracks: list[ExtractedTrack] = []
     heading_disc = 1
@@ -370,9 +417,10 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
 
         duration_raw = str(item.get("duration") or "").strip()
         duration_sec = parse_duration_seconds(duration_raw)
+        has_valid_dur = duration_sec is not None and duration_sec > 0
         merged_extra_raw = list(parent_extra_raw or []) + list(item.get("extraartists") or [])
         track_extra = _parse_extraartist_credits(
-            merged_extra_raw, credit_source="track"
+            merged_extra_raw, credit_source="track", source_url=url
         )
 
         tracks.append(
@@ -388,9 +436,13 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
                 duration_sec=duration_sec,
                 performing_artists=artists,
                 performing_artist_display=artist_disp,
-                has_valid_duration=duration_sec is not None and duration_sec > 0,
+                has_valid_duration=has_valid_dur,
                 has_resolved_performer=resolved,
                 credits=track_extra,
+                duration_source=source_provider if has_valid_dur else "",
+                duration_source_url=url if has_valid_dur else "",
+                performer_source=source_provider if resolved else "",
+                performer_source_url=url if resolved else "",
             )
         )
 
@@ -435,7 +487,9 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
     for rel_extra in raw_json.get("extraartists") or []:
         scope = str(rel_extra.get("tracks") or "").strip()
         if not scope:
-            parsed_credits = _parse_extraartist_credits([rel_extra], credit_source="release_all")
+            parsed_credits = _parse_extraartist_credits(
+                [rel_extra], credit_source="release_all", source_url=url
+            )
             for track in tracks:
                 track.credits.extend(parsed_credits)
             continue
@@ -453,7 +507,9 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
             )
             continue
 
-        parsed_credits = _parse_extraartist_credits([rel_extra], credit_source="release_range")
+        parsed_credits = _parse_extraartist_credits(
+            [rel_extra], credit_source="release_range", source_url=url
+        )
         for idx in target_indices:
             tracks[idx].credits.extend(parsed_credits)
 
@@ -501,6 +557,7 @@ def extract_release(raw_json: dict[str, Any]) -> ExtractedRelease:
         raw_json=raw_json,
         barcode_entries=barcode_entries,
         tracks=tracks,
+        source_provider=source_provider,
     )
 
 
@@ -522,6 +579,7 @@ def extracted_track_to_out(track: ExtractedTrack) -> TrackOut:
                 role_raw=credit.role_raw,
                 role_category=credit.role_category,
                 credit_source=credit.credit_source,
+                source_url=credit.source_url,
             )
         )
     return TrackOut(
@@ -538,5 +596,13 @@ def extracted_track_to_out(track: ExtractedTrack) -> TrackOut:
         performing_artist_display=track.performing_artist_display,
         has_valid_duration=track.has_valid_duration,
         has_resolved_performer=track.has_resolved_performer,
+        isrc=track.isrc,
+        isrc_source=track.isrc_source,
+        isrc_source_url=track.isrc_source_url,
+        duration_source=track.duration_source,
+        duration_source_url=track.duration_source_url,
+        performer_source=track.performer_source,
+        performer_source_url=track.performer_source_url,
+        enrichment_notes=list(track.enrichment_notes),
         credits=buckets,
     )

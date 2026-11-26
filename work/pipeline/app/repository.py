@@ -20,9 +20,19 @@ from app.models import (
     ReviewOut,
     ReviewRequest,
     TrackArtistOut,
+    TrackCreditOut,
     TrackOut,
 )
-from app.extractor import extracted_track_to_out
+from app.extractor import CREDIT_BUCKETS, extracted_track_to_out, format_duration_raw
+
+ACTIVE_QUEUE_STAGES = (
+    "queued_discogs",
+    "checking_discogs",
+    "queued_agent",
+    "checking_agent",
+    "queued_enrich",
+    "checking_enrich",
+)
 
 
 def _iso_or_none(dt: datetime | None) -> str | None:
@@ -118,6 +128,19 @@ class PipelineRepository:
                 cur.fetchone()
         return True
 
+    def reset_pipeline_state(self, clear_api_cache: bool = False) -> None:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                if clear_api_cache:
+                    cur.execute(
+                        "TRUNCATE TABLE queue_jobs, input_records, releases, agent_fallbacks, api_cache RESTART IDENTITY CASCADE"
+                    )
+                else:
+                    cur.execute(
+                        "TRUNCATE TABLE queue_jobs, input_records, releases, agent_fallbacks RESTART IDENTITY CASCADE"
+                    )
+            conn.commit()
+
     def get_api_cache(self, cache_key: str) -> dict[str, Any] | None:
         with self._pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -198,7 +221,7 @@ class PipelineRepository:
                         year, country, formats_json, identifiers_json, labels_json,
                         data_quality, community_status, community_have, community_want,
                         notes, track_count, tracklist_hash, unscoped_credits_json,
-                        raw_json, fetched_at
+                        raw_json, source_provider, fetched_at
                     )
                     VALUES (
                         %s, %s, %s, %s,
@@ -206,7 +229,7 @@ class PipelineRepository:
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, %s, %s,
-                        %s, NOW()
+                        %s, %s, NOW()
                     )
                     ON CONFLICT (discogs_release_id) DO UPDATE SET
                         master_id = EXCLUDED.master_id,
@@ -230,6 +253,7 @@ class PipelineRepository:
                         tracklist_hash = EXCLUDED.tracklist_hash,
                         unscoped_credits_json = EXCLUDED.unscoped_credits_json,
                         raw_json = EXCLUDED.raw_json,
+                        source_provider = EXCLUDED.source_provider,
                         fetched_at = NOW()
                     """,
                     (
@@ -255,6 +279,7 @@ class PipelineRepository:
                         rel.tracklist_hash,
                         Jsonb(rel.unscoped_credits),
                         Jsonb(rel.raw_json),
+                        rel.source_provider,
                     ),
                 )
 
@@ -284,9 +309,17 @@ class PipelineRepository:
                             discogs_release_id, track_order, disc_number, disc_label,
                             position, entry_type, parent_position, title,
                             duration_raw, duration_sec, performing_artists_json,
-                            performing_artist_display, has_valid_duration, has_resolved_performer
+                            performing_artist_display, has_valid_duration, has_resolved_performer,
+                            isrc, isrc_source, isrc_source_url,
+                            duration_source, duration_source_url,
+                            performer_source, performer_source_url,
+                            enrichment_notes_json
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s
+                        )
                         RETURNING id
                         """,
                         (
@@ -304,6 +337,14 @@ class PipelineRepository:
                             track.performing_artist_display,
                             track.has_valid_duration,
                             track.has_resolved_performer,
+                            track.isrc,
+                            track.isrc_source,
+                            track.isrc_source_url,
+                            track.duration_source,
+                            track.duration_source_url,
+                            track.performer_source,
+                            track.performer_source_url,
+                            Jsonb(track.enrichment_notes),
                         ),
                     )
                     track_id = cur.fetchone()[0]
@@ -312,9 +353,9 @@ class PipelineRepository:
                             """
                             INSERT INTO track_credits (
                                 track_id, discogs_artist_id, artist_name, anv,
-                                role_raw, role_category, credit_source
+                                role_raw, role_category, credit_source, source_url
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (track_id, artist_name, role_raw, credit_source) DO NOTHING
                             """,
                             (
@@ -325,6 +366,7 @@ class PipelineRepository:
                                 credit.role_raw,
                                 credit.role_category,
                                 credit.credit_source,
+                                credit.source_url,
                             ),
                         )
             conn.commit()
@@ -368,6 +410,7 @@ class PipelineRepository:
                                 role_raw=cr["role_raw"],
                                 role_category=cr["role_category"],
                                 credit_source=cr["credit_source"],
+                                source_url=str(cr.get("source_url") or ""),
                             )
                         )
 
@@ -392,6 +435,14 @@ class PipelineRepository:
                     has_valid_duration=tr["has_valid_duration"],
                     has_resolved_performer=tr["has_resolved_performer"],
                     credits=credits_by_track.get(tr["id"], []),
+                    isrc=str(tr.get("isrc") or ""),
+                    isrc_source=str(tr.get("isrc_source") or ""),
+                    isrc_source_url=str(tr.get("isrc_source_url") or ""),
+                    duration_source=str(tr.get("duration_source") or ""),
+                    duration_source_url=str(tr.get("duration_source_url") or ""),
+                    performer_source=str(tr.get("performer_source") or ""),
+                    performer_source_url=str(tr.get("performer_source_url") or ""),
+                    enrichment_notes=list(tr.get("enrichment_notes_json") or []),
                 )
             )
 
@@ -420,6 +471,7 @@ class PipelineRepository:
             raw_json=rel_row["raw_json"] or {},
             barcode_entries=[(b["barcode_norm"], b["barcode_raw"]) for b in barcode_rows],
             tracks=tracks,
+            source_provider=str(rel_row.get("source_provider") or "discogs"),
         )
 
     def find_latest_run(
@@ -544,13 +596,25 @@ class PipelineRepository:
                 fb_row = cur.fetchone()
                 fb_id = int(fb_row["id"])
                 for track_number, track in tracks:
+                    credits_dump = {
+                        bucket: [c.model_dump() for c in track.credits.get(bucket, [])]
+                        for bucket in ("composers", "lyricists", "producers", "featured", "other")
+                    }
                     cur.execute(
                         """
                         INSERT INTO agent_fallback_tracks (
                             agent_fallback_id, track_order, disc_number, track_number,
-                            position, title, duration_raw, duration_sec
+                            position, title, duration_raw, duration_sec,
+                            performing_artists_json, performing_artist_display,
+                            has_resolved_performer, isrc, isrc_source, isrc_source_url,
+                            duration_source, duration_source_url,
+                            performer_source, performer_source_url,
+                            credits_json, enrichment_notes_json
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
                         """,
                         (
                             fb_id,
@@ -561,6 +625,18 @@ class PipelineRepository:
                             track.title,
                             track.duration_raw,
                             track.duration_sec,
+                            Jsonb([a.model_dump() for a in track.performing_artists]),
+                            track.performing_artist_display,
+                            track.has_resolved_performer,
+                            track.isrc,
+                            track.isrc_source,
+                            track.isrc_source_url,
+                            track.duration_source,
+                            track.duration_source_url,
+                            track.performer_source,
+                            track.performer_source_url,
+                            Jsonb(credits_dump),
+                            Jsonb(track.enrichment_notes),
                         ),
                     )
             conn.commit()
@@ -599,24 +675,46 @@ class PipelineRepository:
                 track_rows = cur.fetchall()
 
         has_multi_disc = any(int(tr["disc_number"]) > 1 for tr in track_rows)
-        tracks_out = [
-            TrackOut(
-                track_order=int(tr["track_order"]),
-                disc_number=int(tr["disc_number"]),
-                disc_label=f"Disc {tr['disc_number']}" if has_multi_disc else "",
-                position=tr["position"],
-                entry_type="track",
-                parent_position="",
-                title=tr["title"],
-                duration_raw=tr["duration_raw"],
-                duration_sec=tr["duration_sec"],
-                performing_artists=[],
-                performing_artist_display="",
-                has_valid_duration=tr["duration_sec"] is not None,
-                has_resolved_performer=False,
+        tracks_out: list[TrackOut] = []
+        for tr in track_rows:
+            raw_credits = tr.get("credits_json") or {}
+            credits_out: dict[str, list[TrackCreditOut]] = {}
+            for bucket in ("composers", "lyricists", "producers", "featured", "other"):
+                credits_out[bucket] = [
+                    TrackCreditOut(**c) if isinstance(c, dict) else c
+                    for c in (raw_credits.get(bucket) or [])
+                ]
+            dur_sec = tr["duration_sec"]
+            has_valid_dur = dur_sec is not None and int(dur_sec) > 0
+            artists = [
+                TrackArtistOut(**a) for a in (tr.get("performing_artists_json") or [])
+            ]
+            tracks_out.append(
+                TrackOut(
+                    track_order=int(tr["track_order"]),
+                    disc_number=int(tr["disc_number"]),
+                    disc_label=f"Disc {tr['disc_number']}" if has_multi_disc else "",
+                    position=tr["position"],
+                    entry_type="track",
+                    parent_position="",
+                    title=tr["title"],
+                    duration_raw=tr["duration_raw"] or (format_duration_raw(dur_sec) if has_valid_dur else ""),
+                    duration_sec=dur_sec,
+                    performing_artists=artists,
+                    performing_artist_display=str(tr.get("performing_artist_display") or ""),
+                    has_valid_duration=has_valid_dur,
+                    has_resolved_performer=bool(tr.get("has_resolved_performer", False)),
+                    isrc=str(tr.get("isrc") or ""),
+                    isrc_source=str(tr.get("isrc_source") or ""),
+                    isrc_source_url=str(tr.get("isrc_source_url") or ""),
+                    duration_source=str(tr.get("duration_source") or ""),
+                    duration_source_url=str(tr.get("duration_source_url") or ""),
+                    performer_source=str(tr.get("performer_source") or ""),
+                    performer_source_url=str(tr.get("performer_source_url") or ""),
+                    enrichment_notes=list(tr.get("enrichment_notes_json") or []),
+                    credits=credits_out,
+                )
             )
-            for tr in track_rows
-        ]
         fb_out = AgentFallbackOut(
             agent_fallback_id=int(fb_row["id"]),
             model_name=fb_row["model_name"],
@@ -728,9 +826,9 @@ class PipelineRepository:
                         r.url AS selected_release_url,
                         lr.selected_agent_fallback_id,
                         af.sources_json->>0 AS agent_source_url,
-                        COALESCE(af.input_tokens, 0) AS agent_input_tokens,
-                        COALESCE(af.output_tokens, 0) AS agent_output_tokens,
-                        COALESCE(af.cost_usd, 0.0) AS agent_cost_usd,
+                        COALESCE(af.input_tokens, 0) + COALESCE(r.enrichment_input_tokens, 0) AS agent_input_tokens,
+                        COALESCE(af.output_tokens, 0) + COALESCE(r.enrichment_output_tokens, 0) AS agent_output_tokens,
+                        COALESCE(af.cost_usd, 0.0) + COALESCE(r.enrichment_cost_usd, 0.0) AS agent_cost_usd,
                         lr.created_at AS latest_checked_at
                     FROM input_records ir
                     LEFT JOIN LATERAL (
@@ -799,9 +897,9 @@ class PipelineRepository:
                         r.url AS selected_release_url,
                         lr.selected_agent_fallback_id,
                         af.sources_json->>0 AS agent_source_url,
-                        COALESCE(af.input_tokens, 0) AS agent_input_tokens,
-                        COALESCE(af.output_tokens, 0) AS agent_output_tokens,
-                        COALESCE(af.cost_usd, 0.0) AS agent_cost_usd,
+                        COALESCE(af.input_tokens, 0) + COALESCE(r.enrichment_input_tokens, 0) AS agent_input_tokens,
+                        COALESCE(af.output_tokens, 0) + COALESCE(r.enrichment_output_tokens, 0) AS agent_output_tokens,
+                        COALESCE(af.cost_usd, 0.0) + COALESCE(r.enrichment_cost_usd, 0.0) AS agent_cost_usd,
                         lr.created_at AS latest_checked_at
                     FROM input_records ir
                     LEFT JOIN LATERAL (
@@ -1118,6 +1216,388 @@ class PipelineRepository:
         )
 
     # ------------------------------------------------------------------ #
+    # Track enrichment persistence & coverage refresh
+    # ------------------------------------------------------------------ #
+
+    def update_release_track_enrichments(
+        self,
+        discogs_release_id: int,
+        tracks: list[TrackOut],
+        mark_enriched: bool = True,
+        add_input_tokens: int = 0,
+        add_output_tokens: int = 0,
+        add_cost_usd: float = 0.0,
+    ) -> None:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                for track in tracks:
+                    cur.execute(
+                        """
+                        UPDATE tracks
+                        SET duration_raw = %s,
+                            duration_sec = %s,
+                            has_valid_duration = %s,
+                            performing_artists_json = %s,
+                            performing_artist_display = %s,
+                            has_resolved_performer = %s,
+                            isrc = %s,
+                            isrc_source = %s,
+                            isrc_source_url = %s,
+                            duration_source = %s,
+                            duration_source_url = %s,
+                            performer_source = %s,
+                            performer_source_url = %s,
+                            enrichment_notes_json = %s
+                        WHERE discogs_release_id = %s AND track_order = %s
+                        RETURNING id
+                        """,
+                        (
+                            track.duration_raw,
+                            track.duration_sec,
+                            track.has_valid_duration,
+                            Jsonb([a.model_dump() for a in track.performing_artists]),
+                            track.performing_artist_display,
+                            track.has_resolved_performer,
+                            track.isrc,
+                            track.isrc_source,
+                            track.isrc_source_url,
+                            track.duration_source,
+                            track.duration_source_url,
+                            track.performer_source,
+                            track.performer_source_url,
+                            Jsonb(track.enrichment_notes),
+                            discogs_release_id,
+                            track.track_order,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        continue
+                    track_id = int(row[0])
+                    for bucket_credits in track.credits.values():
+                        for credit in bucket_credits:
+                            cur.execute(
+                                """
+                                INSERT INTO track_credits (
+                                    track_id, discogs_artist_id, artist_name, anv,
+                                    role_raw, role_category, credit_source, source_url
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (track_id, artist_name, role_raw, credit_source) DO NOTHING
+                                """,
+                                (
+                                    track_id,
+                                    credit.discogs_artist_id,
+                                    credit.artist_name,
+                                    credit.anv,
+                                    credit.role_raw,
+                                    credit.role_category,
+                                    credit.credit_source,
+                                    credit.source_url,
+                                ),
+                            )
+                if mark_enriched or add_input_tokens or add_output_tokens or add_cost_usd:
+                    cur.execute(
+                        """
+                        UPDATE releases
+                        SET enriched_at = CASE WHEN %s THEN NOW() ELSE enriched_at END,
+                            enrichment_input_tokens = enrichment_input_tokens + %s,
+                            enrichment_output_tokens = enrichment_output_tokens + %s,
+                            enrichment_cost_usd = enrichment_cost_usd + %s
+                        WHERE discogs_release_id = %s
+                        """,
+                        (
+                            mark_enriched,
+                            add_input_tokens,
+                            add_output_tokens,
+                            add_cost_usd,
+                            discogs_release_id,
+                        ),
+                    )
+            conn.commit()
+
+    def update_agent_fallback_track_enrichments(
+        self,
+        agent_fallback_id: int,
+        tracks: list[TrackOut],
+        mark_enriched: bool = True,
+        add_input_tokens: int = 0,
+        add_output_tokens: int = 0,
+        add_cost_usd: float = 0.0,
+    ) -> None:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                for track in tracks:
+                    credits_dump = {
+                        bucket: [c.model_dump() for c in track.credits.get(bucket, [])]
+                        for bucket in ("composers", "lyricists", "producers", "featured", "other")
+                    }
+                    cur.execute(
+                        """
+                        UPDATE agent_fallback_tracks
+                        SET duration_raw = %s,
+                            duration_sec = %s,
+                            performing_artists_json = %s,
+                            performing_artist_display = %s,
+                            has_resolved_performer = %s,
+                            isrc = %s,
+                            isrc_source = %s,
+                            isrc_source_url = %s,
+                            duration_source = %s,
+                            duration_source_url = %s,
+                            performer_source = %s,
+                            performer_source_url = %s,
+                            credits_json = %s,
+                            enrichment_notes_json = %s
+                        WHERE agent_fallback_id = %s AND track_order = %s
+                        """,
+                        (
+                            track.duration_raw,
+                            track.duration_sec,
+                            Jsonb([a.model_dump() for a in track.performing_artists]),
+                            track.performing_artist_display,
+                            track.has_resolved_performer,
+                            track.isrc,
+                            track.isrc_source,
+                            track.isrc_source_url,
+                            track.duration_source,
+                            track.duration_source_url,
+                            track.performer_source,
+                            track.performer_source_url,
+                            Jsonb(credits_dump),
+                            Jsonb(track.enrichment_notes),
+                            agent_fallback_id,
+                            track.track_order,
+                        ),
+                    )
+                if mark_enriched or add_input_tokens or add_output_tokens or add_cost_usd:
+                    cur.execute(
+                        """
+                        UPDATE agent_fallbacks
+                        SET enriched_at = CASE WHEN %s THEN NOW() ELSE enriched_at END,
+                            input_tokens = input_tokens + %s,
+                            output_tokens = output_tokens + %s,
+                            cost_usd = cost_usd + %s
+                        WHERE id = %s
+                        """,
+                        (
+                            mark_enriched,
+                            add_input_tokens,
+                            add_output_tokens,
+                            add_cost_usd,
+                            agent_fallback_id,
+                        ),
+                    )
+            conn.commit()
+
+    def is_target_already_enriched(
+        self,
+        selected_release_id: int | None,
+        selected_agent_fallback_id: int | None,
+    ) -> bool:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                if selected_release_id is not None:
+                    cur.execute(
+                        "SELECT enriched_at IS NOT NULL FROM releases WHERE discogs_release_id = %s",
+                        (selected_release_id,),
+                    )
+                    row = cur.fetchone()
+                    return bool(row and row[0])
+                if selected_agent_fallback_id is not None:
+                    cur.execute(
+                        "SELECT enriched_at IS NOT NULL FROM agent_fallbacks WHERE id = %s",
+                        (selected_agent_fallback_id,),
+                    )
+                    row = cur.fetchone()
+                    return bool(row and row[0])
+        return False
+
+    def find_sibling_releases(
+        self, input_id: int, selected_release_id: int, master_id: int | None
+    ) -> list[ExtractedRelease]:
+        sibling_ids: list[int] = []
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT discogs_release_id
+                    FROM input_matches
+                    WHERE input_id = %s AND discogs_release_id <> %s
+                    ORDER BY match_rank ASC
+                    LIMIT 5
+                    """,
+                    (input_id, selected_release_id),
+                )
+                for (rid,) in cur.fetchall():
+                    if int(rid) not in sibling_ids:
+                        sibling_ids.append(int(rid))
+
+                if master_id is not None:
+                    cur.execute(
+                        """
+                        SELECT discogs_release_id
+                        FROM releases
+                        WHERE master_id = %s AND discogs_release_id <> %s
+                        LIMIT 5
+                        """,
+                        (master_id, selected_release_id),
+                    )
+                    for (rid,) in cur.fetchall():
+                        if int(rid) not in sibling_ids:
+                            sibling_ids.append(int(rid))
+
+        releases: list[ExtractedRelease] = []
+        for rid in sibling_ids[:6]:
+            rel = self.get_extracted_release(rid)
+            if rel is not None:
+                releases.append(rel)
+        return releases
+
+    def list_matched_inputs_with_missing_track_data(
+        self, limit: int = 100, force_refresh: bool = False
+    ) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        ir.*,
+                        lr.selected_release_id,
+                        lr.selected_agent_fallback_id,
+                        lr.status AS latest_status,
+                        lr.source AS latest_source
+                    FROM input_records ir
+                    JOIN LATERAL (
+                        SELECT status, source, selected_release_id, selected_agent_fallback_id
+                        FROM lookup_runs
+                        WHERE input_id = ir.id
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    ) lr ON TRUE
+                    LEFT JOIN releases r ON r.discogs_release_id = lr.selected_release_id
+                    LEFT JOIN agent_fallbacks af ON af.id = lr.selected_agent_fallback_id
+                    WHERE lr.status IN ('matched', 'needs_review')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM queue_items qi
+                          WHERE qi.input_id = ir.id
+                            AND qi.stage = ANY(%s)
+                      )
+                      AND (
+                          (
+                              lr.selected_release_id IS NOT NULL
+                              AND r.discogs_release_id IS NOT NULL
+                              AND (%s OR r.enriched_at IS NULL)
+                              AND EXISTS (
+                                  SELECT 1 FROM tracks t
+                                  WHERE t.discogs_release_id = lr.selected_release_id
+                                    AND (
+                                        NOT t.has_valid_duration
+                                        OR NOT t.has_resolved_performer
+                                        OR t.isrc = ''
+                                        OR NOT EXISTS (
+                                            SELECT 1 FROM track_credits tc
+                                            WHERE tc.track_id = t.id
+                                              AND tc.role_category IN ('composer', 'lyricist')
+                                        )
+                                        OR NOT EXISTS (
+                                            SELECT 1 FROM track_credits tc
+                                            WHERE tc.track_id = t.id
+                                              AND tc.role_category = 'producer'
+                                        )
+                                    )
+                              )
+                          )
+                          OR (
+                              lr.selected_agent_fallback_id IS NOT NULL
+                              AND af.id IS NOT NULL
+                              AND (%s OR af.enriched_at IS NULL)
+                              AND EXISTS (
+                                  SELECT 1 FROM agent_fallback_tracks aft
+                                  WHERE aft.agent_fallback_id = lr.selected_agent_fallback_id
+                                    AND (
+                                        aft.duration_sec IS NULL
+                                        OR aft.duration_sec <= 0
+                                        OR NOT aft.has_resolved_performer
+                                        OR aft.isrc = ''
+                                        OR COALESCE(jsonb_array_length(aft.credits_json->'composers'), 0)
+                                         + COALESCE(jsonb_array_length(aft.credits_json->'lyricists'), 0) = 0
+                                        OR COALESCE(jsonb_array_length(aft.credits_json->'producers'), 0) = 0
+                                    )
+                              )
+                          )
+                      )
+                    ORDER BY ir.id ASC
+                    LIMIT %s
+                    """,
+                    (list(ACTIVE_QUEUE_STAGES), force_refresh, force_refresh, limit),
+                )
+                return cur.fetchall()
+
+    def refresh_latest_run_coverage(
+        self,
+        input_id: int,
+        duration_cov: float,
+        performer_cov: float,
+        writer_cov: float,
+        producer_cov: float,
+    ) -> str | None:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, status, source, evaluation_summary_json, review_reasons_json
+                    FROM lookup_runs
+                    WHERE input_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (input_id,),
+                )
+                run = cur.fetchone()
+                if run is None:
+                    conn.rollback()
+                    return None
+
+                summary = dict(run.get("evaluation_summary_json") or {})
+                summary["duration_coverage"] = duration_cov
+                summary["performer_coverage"] = performer_cov
+                summary["writer_credit_coverage"] = writer_cov
+                summary["producer_credit_coverage"] = producer_cov
+
+                reasons = list(run.get("review_reasons_json") or [])
+                if performer_cov >= 1.0:
+                    reasons = [
+                        r
+                        for r in reasons
+                        if not str(r).startswith("Performing artists missing/unresolved")
+                    ]
+                    if "review_reasons" in summary:
+                        summary["review_reasons"] = reasons
+
+                new_status = str(run["status"])
+                if (
+                    new_status == "needs_review"
+                    and not reasons
+                    and not str(run.get("source") or "").startswith("gemini_agent")
+                ):
+                    new_status = "matched"
+
+                cur.execute(
+                    """
+                    UPDATE lookup_runs
+                    SET status = %s,
+                        evaluation_summary_json = %s,
+                        review_reasons_json = %s
+                    WHERE id = %s
+                    """,
+                    (new_status, Jsonb(summary), Jsonb(reasons), run["id"]),
+                )
+            conn.commit()
+        return new_status
+
+    # ------------------------------------------------------------------ #
     # Queue operations (PostgreSQL FOR UPDATE SKIP LOCKED)
     # ------------------------------------------------------------------ #
 
@@ -1134,12 +1614,25 @@ class PipelineRepository:
                     """
                     SELECT 1 FROM queue_items
                     WHERE input_id = %s
-                      AND stage IN ('queued_discogs', 'checking_discogs', 'queued_agent', 'checking_agent')
+                      AND stage = ANY(%s)
                     LIMIT 1
                     """,
-                    (input_id,),
+                    (input_id, list(ACTIVE_QUEUE_STAGES)),
                 )
                 return cur.fetchone() is not None
+
+    def is_queue_idle(self) -> bool:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1 FROM queue_items
+                    WHERE stage = ANY(%s)
+                    LIMIT 1
+                    """,
+                    (list(ACTIVE_QUEUE_STAGES),),
+                )
+                return cur.fetchone() is None
 
     def list_not_found_records_for_agent_retry(self) -> list[dict[str, Any]]:
         with self._pool.connection() as conn:
@@ -1159,10 +1652,11 @@ class PipelineRepository:
                       AND NOT EXISTS (
                           SELECT 1 FROM queue_items qi
                           WHERE qi.input_id = ir.id
-                            AND qi.stage IN ('queued_discogs', 'checking_discogs', 'queued_agent', 'checking_agent')
+                            AND qi.stage = ANY(%s)
                       )
                     ORDER BY ir.id ASC
-                    """
+                    """,
+                    (list(ACTIVE_QUEUE_STAGES),),
                 )
                 return cur.fetchall()
 
@@ -1170,7 +1664,8 @@ class PipelineRepository:
     def _recompute_job_summary(cur: Any, job_id: int) -> tuple[dict[str, Any], bool]:
         cur.execute(
             """
-            SELECT status, started_at, finished_at, total_items
+            SELECT status, started_at, finished_at, total_items,
+                   completed_items, output_path, output_json_path
             FROM queue_jobs
             WHERE id = %s
             FOR UPDATE
@@ -1182,15 +1677,19 @@ class PipelineRepository:
         prev_status = str(job_row["status"])
         prev_started_at = job_row["started_at"]
         prev_finished_at = job_row["finished_at"]
+        prev_completed_items = int(job_row["completed_items"])
         total_items = int(job_row["total_items"])
+        has_pending_report = bool(job_row["output_path"]) and not bool(
+            job_row["output_json_path"]
+        )
 
         cur.execute(
             """
             SELECT
                 COUNT(*) FILTER (WHERE stage = 'done') AS done_count,
                 COUNT(*) FILTER (WHERE stage = 'cancelled') AS cancelled_count,
-                COUNT(*) FILTER (WHERE stage IN ('checking_discogs', 'checking_agent')) AS active_count,
-                COUNT(*) FILTER (WHERE stage IN ('queued_discogs', 'queued_agent')) AS queued_count,
+                COUNT(*) FILTER (WHERE stage IN ('checking_discogs', 'checking_agent', 'checking_enrich')) AS active_count,
+                COUNT(*) FILTER (WHERE stage IN ('queued_discogs', 'queued_agent', 'queued_enrich')) AS queued_count,
                 COUNT(*) FILTER (WHERE stage = 'done' AND result_status = 'matched') AS matched_count,
                 COUNT(*) FILTER (WHERE stage = 'done' AND result_status = 'needs_review') AS needs_review_count,
                 COUNT(*) FILTER (
@@ -1214,6 +1713,7 @@ class PipelineRepository:
         queued_count = int(agg["queued_count"])
         completed_items = done_count + cancelled_count
 
+        needs_report_finalize = False
         if prev_status == "cancelled":
             new_status = "cancelled"
             mark_finished = active_count == 0 and queued_count == 0
@@ -1221,8 +1721,15 @@ class PipelineRepository:
             if total_items == 0 or (
                 active_count == 0 and queued_count == 0 and completed_items >= total_items
             ):
-                new_status = "completed"
-                mark_finished = True
+                if total_items > 0 and has_pending_report:
+                    new_status = "running"
+                    mark_finished = False
+                    needs_report_finalize = (
+                        prev_completed_items < total_items and prev_finished_at is None
+                    )
+                else:
+                    new_status = "completed"
+                    mark_finished = True
             elif active_count > 0 or completed_items > 0 or prev_started_at is not None:
                 new_status = "running"
                 mark_finished = False
@@ -1269,7 +1776,9 @@ class PipelineRepository:
             ),
         )
         updated = cur.fetchone()
-        just_finished = prev_finished_at is None and updated["finished_at"] is not None
+        just_finished = needs_report_finalize or (
+            prev_finished_at is None and updated["finished_at"] is not None
+        )
         return updated, just_finished
 
     def create_queue_job(
@@ -1318,9 +1827,9 @@ class PipelineRepository:
                         """
                         INSERT INTO queue_items (
                             job_id, row_number, input_id, barcode, album_title, album_artist,
-                            force_refresh, mode, stage, status_message
+                            force_refresh, mode, stage, status_message, context_json
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             job_id,
@@ -1333,6 +1842,7 @@ class PipelineRepository:
                             str(item.get("mode", "full")),
                             str(item.get("stage", "queued_discogs")),
                             str(item.get("status_message") or "Waiting in queue"),
+                            Jsonb(item.get("context_json") or {}),
                         ),
                     )
             conn.commit()
@@ -1464,6 +1974,83 @@ class PipelineRepository:
             conn.commit()
         return True, False
 
+    def handoff_item_to_enrich(
+        self,
+        item_id: int,
+        job_id: int,
+        input_id: int,
+        selected_release_id: int | None,
+        selected_agent_fallback_id: int | None,
+        track_count: int,
+        context: dict[str, Any],
+        status_message: str,
+    ) -> tuple[bool, bool]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT status FROM queue_jobs WHERE id = %s FOR UPDATE",
+                    (job_id,),
+                )
+                job_row = cur.fetchone()
+                if job_row is not None and job_row["status"] == "cancelled":
+                    cur.execute(
+                        """
+                        UPDATE queue_items
+                        SET stage = 'done',
+                            worker_name = '',
+                            input_id = %s,
+                            result_status = %s,
+                            result_http_code = 200,
+                            result_source = %s,
+                            selected_release_id = %s,
+                            selected_agent_fallback_id = %s,
+                            track_count = %s,
+                            status_message = 'Completed before enrich stage (job cancelled)',
+                            finished_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            input_id,
+                            str(context.get("result_status") or "matched"),
+                            str(context.get("result_source") or ""),
+                            selected_release_id,
+                            selected_agent_fallback_id,
+                            track_count,
+                            item_id,
+                        ),
+                    )
+                    _, just_finished = self._recompute_job_summary(cur, job_id)
+                    conn.commit()
+                    return False, just_finished
+
+                cur.execute(
+                    """
+                    UPDATE queue_items
+                    SET stage = 'queued_enrich',
+                        worker_name = '',
+                        input_id = %s,
+                        selected_release_id = %s,
+                        selected_agent_fallback_id = %s,
+                        track_count = %s,
+                        context_json = %s,
+                        status_message = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        input_id,
+                        selected_release_id,
+                        selected_agent_fallback_id,
+                        track_count,
+                        Jsonb(context),
+                        status_message,
+                        item_id,
+                    ),
+                )
+            conn.commit()
+        return True, False
+
     def complete_queue_item(
         self,
         item_id: int,
@@ -1539,7 +2126,7 @@ class PipelineRepository:
                         finished_at = NOW(),
                         updated_at = NOW()
                     WHERE job_id = %s
-                      AND stage IN ('queued_discogs', 'queued_agent')
+                      AND stage IN ('queued_discogs', 'queued_agent', 'queued_enrich')
                     """,
                     (job_id,),
                 )
@@ -1573,24 +2160,53 @@ class PipelineRepository:
                     """
                 )
                 total_reset += cur.rowcount or 0
+                cur.execute(
+                    """
+                    UPDATE queue_items
+                    SET stage = 'queued_enrich',
+                        worker_name = '',
+                        status_message = 'Recovered after restart',
+                        updated_at = NOW()
+                    WHERE stage = 'checking_enrich'
+                    """
+                )
+                total_reset += cur.rowcount or 0
             conn.commit()
         return total_reset
 
     def set_queue_job_report_paths(
-        self, job_id: int, output_json_path: str, output_markdown_path: str
+        self,
+        job_id: int,
+        output_json_path: str,
+        output_markdown_path: str,
+        mark_completed: bool = True,
     ) -> None:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE queue_jobs
-                    SET output_json_path = %s,
-                        output_markdown_path = %s,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (output_json_path, output_markdown_path, job_id),
-                )
+                if mark_completed:
+                    cur.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET output_json_path = %s,
+                            output_markdown_path = %s,
+                            status = CASE WHEN status <> 'cancelled' THEN 'completed' ELSE status END,
+                            finished_at = COALESCE(finished_at, NOW()),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (output_json_path, output_markdown_path, job_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE queue_jobs
+                        SET output_json_path = %s,
+                            output_markdown_path = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (output_json_path, output_markdown_path, job_id),
+                    )
             conn.commit()
 
     def get_queue_job(self, job_id: int) -> QueueJobDetailOut | None:
@@ -1644,7 +2260,9 @@ class PipelineRepository:
                         COUNT(*) FILTER (WHERE stage = 'queued_discogs') AS queued_discogs,
                         COUNT(*) FILTER (WHERE stage = 'checking_discogs') AS checking_discogs,
                         COUNT(*) FILTER (WHERE stage = 'queued_agent') AS queued_agent,
-                        COUNT(*) FILTER (WHERE stage = 'checking_agent') AS checking_agent
+                        COUNT(*) FILTER (WHERE stage = 'checking_agent') AS checking_agent,
+                        COUNT(*) FILTER (WHERE stage = 'queued_enrich') AS queued_enrich,
+                        COUNT(*) FILTER (WHERE stage = 'checking_enrich') AS checking_enrich
                     FROM queue_items
                     """
                 )
@@ -1653,7 +2271,7 @@ class PipelineRepository:
                 cur.execute(
                     """
                     SELECT * FROM queue_items
-                    WHERE stage IN ('checking_discogs', 'checking_agent')
+                    WHERE stage IN ('checking_discogs', 'checking_agent', 'checking_enrich')
                     ORDER BY started_at ASC NULLS LAST, id ASC
                     """
                 )
@@ -1662,7 +2280,7 @@ class PipelineRepository:
                 cur.execute(
                     """
                     SELECT * FROM queue_items
-                    WHERE stage IN ('queued_discogs', 'queued_agent')
+                    WHERE stage IN ('queued_discogs', 'queued_agent', 'queued_enrich')
                     ORDER BY id ASC
                     LIMIT %s
                     """,
@@ -1685,6 +2303,8 @@ class PipelineRepository:
             checking_discogs=int(cnt["checking_discogs"]),
             queued_agent=int(cnt["queued_agent"]),
             checking_agent=int(cnt["checking_agent"]),
+            queued_enrich=int(cnt["queued_enrich"]),
+            checking_enrich=int(cnt["checking_enrich"]),
         )
         return (
             counts,

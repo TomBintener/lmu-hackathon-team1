@@ -120,3 +120,70 @@ def test_evaluator_flags_quality_disc_mismatch_and_unconfirmed_barcode() -> None
     assert "Supplied barcode was not confirmed" in reasons
     assert "Needs Major Changes" in reasons
     assert "disc count" in reasons
+
+
+def test_evaluator_matches_label_catno_titles_and_rejects_wrong_catno_number() -> None:
+    comp_tracks = [
+        {
+            "type_": "track",
+            "position": "A1",
+            "title": "Track One",
+            "duration": "6:03",
+            "artists": [{"id": 701, "name": "Dan Piu"}],
+        },
+        {
+            "type_": "track",
+            "position": "B1",
+            "title": "Track Two",
+            "duration": "4:32",
+            "artists": [{"id": 702, "name": "Rinaldo Makaj"}],
+        },
+    ]
+    norm_432 = normalize_input("", "432HERTZ 002", "VA")
+    rel_432 = make_sample_release(
+        release_id=35007128,
+        title="303rd Dimensions",
+        artist="Various",
+        barcode="",
+        formats=[{"name": "Vinyl", "qty": "1", "descriptions": ['12"']}],
+        notes="",
+        tracklist=comp_tracks,
+    )
+    rel_432["labels"] = [{"name": "432HERTZ BERLIN", "catno": "432-002"}]
+    bundle_432 = evaluate_candidates(
+        norm_432, [extract_release(rel_432)], {35007128: "label_catno_structured"}
+    )
+    assert bundle_432.status == "matched"
+    assert bundle_432.selected is not None
+    assert bundle_432.selected.discogs_release_id == 35007128
+
+    norm_jf = normalize_input("0", "Jackfruit Traxx 1", "Various Artists")
+    rel_jf1 = make_sample_release(
+        release_id=36475918,
+        title="Traxx Salad Vol. 1",
+        artist="Various",
+        barcode="",
+        formats=[{"name": "Vinyl", "qty": "1", "descriptions": ['12"']}],
+        notes="",
+        tracklist=comp_tracks,
+    )
+    rel_jf1["labels"] = [{"name": "JackFruit Traxx", "catno": "JFXX1"}]
+    rel_jf2 = make_sample_release(
+        release_id=37837974,
+        title="Traxx Salad Vol. 2",
+        artist="Various",
+        barcode="",
+        formats=[{"name": "Vinyl", "qty": "1", "descriptions": ['12"']}],
+        notes="",
+        tracklist=comp_tracks,
+    )
+    rel_jf2["labels"] = [{"name": "JackFruit Traxx", "catno": "JFXX2"}]
+    bundle_jf = evaluate_candidates(
+        norm_jf,
+        [extract_release(rel_jf2), extract_release(rel_jf1)],
+        {37837974: "freetext_q", 36475918: "label_catno_structured"},
+    )
+    assert bundle_jf.status == "matched"
+    assert bundle_jf.selected is not None
+    assert bundle_jf.selected.discogs_release_id == 36475918
+    assert bundle_jf.alternatives == []

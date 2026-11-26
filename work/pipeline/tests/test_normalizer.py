@@ -6,6 +6,7 @@ import pytest
 from app.models import LookupRequest
 from app.normalizer import (
     barcode_variants,
+    extract_label_catno_hint,
     normalize_artist,
     normalize_barcode,
     normalize_input,
@@ -113,3 +114,11 @@ def test_lookup_request_rejects_empty_or_zero_only_payloads() -> None:
         LookupRequest(barcode="", album_title="", album_artist="EPICA")
     with pytest.raises(ValueError):
         LookupRequest(barcode="0", album_title="   ", album_artist="Tindersticks")
+
+
+def test_extract_label_catno_hint() -> None:
+    assert extract_label_catno_hint("432HERTZ 002") == ("432HERTZ", "002", 2)
+    assert extract_label_catno_hint("Jackfruit Traxx 1") == ("Jackfruit Traxx", "1", 1)
+    assert extract_label_catno_hint("SCHLAGER ARENA 2025") is None
+    assert extract_label_catno_hint("Traxx Salad Vol. 1") is None
+    assert extract_label_catno_hint("Aspiral") is None

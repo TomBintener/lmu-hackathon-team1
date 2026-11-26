@@ -13,6 +13,8 @@ COMPILATION_ALIASES = {
     "various (sampler)",
     "various sampler",
     "sampler",
+    "verschiedene interpret:innen",
+    "verschiedene interpreten",
 }
 
 TRAILING_ARTICLE_RE = re.compile(
@@ -30,6 +32,23 @@ PAREN_FORMAT_RE = re.compile(
 )
 QTY_MEDIUM_RE = re.compile(r"^(\d+)\s*(CD|LP)$", re.IGNORECASE)
 EP_SUFFIX_RE = re.compile(r"\bEP\b", re.IGNORECASE)
+LABEL_CATNO_TITLE_RE = re.compile(r"^(.{2,}?)\s+#?(0*\d{1,4})$")
+NON_LABEL_SEQ_WORDS = {
+    "vol",
+    "vol.",
+    "volume",
+    "part",
+    "pt",
+    "pt.",
+    "chapter",
+    "episode",
+    "disc",
+    "cd",
+    "lp",
+    "edition",
+    "no",
+    "no.",
+}
 
 
 def normalize_quotes(text: str) -> str:
@@ -160,6 +179,23 @@ def extract_format_and_clean_title(raw_title: str, artist_norm: str) -> tuple[st
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -;:,")
     title_norm = normalize_text(cleaned)
     return cleaned, title_norm, hint
+
+
+def extract_label_catno_hint(title_clean: str) -> tuple[str, str, int] | None:
+    """Detect '<Label> <Number>' inputs where the title encodes label + catalog number."""
+    text = re.sub(r"\s+", " ", (title_clean or "")).strip()
+    match = LABEL_CATNO_TITLE_RE.match(text)
+    if not match:
+        return None
+    prefix = match.group(1).strip(" -–—:;/")
+    raw_num = match.group(2)
+    num_int = int(raw_num)
+    if len(prefix) < 3 or num_int <= 0 or (1900 <= num_int <= 2099):
+        return None
+    last_word = prefix.split()[-1].lower()
+    if last_word in NON_LABEL_SEQ_WORDS:
+        return None
+    return prefix, raw_num, num_int
 
 
 def normalize_input(

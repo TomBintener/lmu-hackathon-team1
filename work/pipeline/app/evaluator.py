@@ -6,10 +6,11 @@ from typing import Literal
 
 from app.extractor import ExtractedRelease
 from app.models import AlternativeEditionOut, EvaluationOut, NormalizedInput
-from app.normalizer import fold_accents, normalize_text
+from app.normalizer import extract_label_catno_hint, fold_accents, normalize_text
 
 NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]+")
 EP_WORD_RE = re.compile(r"\bep\b")
+CATNO_TRAILING_NUM_RE = re.compile(r"(\d+)\s*$")
 LOW_QUALITY_GRADES = {"Needs Major Changes", "Entirely Incorrect"}
 
 
@@ -142,6 +143,33 @@ def _format_alignment(
     return score, hits == checks, disc_consistent
 
 
+def _matches_label_catno(norm: NormalizedInput, release: ExtractedRelease) -> bool:
+    """Match inputs like '432HERTZ 002' or 'Jackfruit Traxx 1' against release label + catno."""
+    hint = extract_label_catno_hint(norm.title_clean)
+    if hint is None:
+        return False
+    prefix, _raw_num, target_int = hint
+    prefix_clean = _clean_for_similarity(prefix)
+    if not prefix_clean:
+        return False
+
+    for lbl in release.labels or []:
+        lbl_name = _clean_for_similarity(str(lbl.get("name") or ""))
+        catno = str(lbl.get("catno") or "").strip()
+        if not lbl_name or not catno:
+            continue
+        label_match = string_similarity(prefix_clean, lbl_name) >= 0.80 or (
+            len(prefix_clean) >= 4
+            and (prefix_clean in lbl_name or lbl_name in prefix_clean)
+        )
+        if not label_match:
+            continue
+        num_match = CATNO_TRAILING_NUM_RE.search(catno)
+        if num_match is not None and int(num_match.group(1)) == target_int:
+            return True
+    return False
+
+
 def evaluate_candidate(
     norm: NormalizedInput,
     release: ExtractedRelease,
@@ -224,20 +252,31 @@ def evaluate_candidate(
                 0.55 + 0.20 * title_sim + 0.15 * artist_sim + 0.10 * format_score + tie_breaker,
             )
     else:
-        if norm.is_compilation and title_sim < 0.65:
-            rejection_reasons.append(
-                f"Release {release.discogs_release_id} compilation title similarity too low ({title_sim:.2f})."
-            )
-        elif not norm.is_compilation and (
-            title_sim < 0.55 or (norm.artist_norm and artist_sim < 0.55)
-        ):
-            rejection_reasons.append(
-                f"Release {release.discogs_release_id} rejected (title_sim={title_sim:.2f}, artist_sim={artist_sim:.2f})."
-            )
-        score = min(
-            1.0,
-            0.52 * title_sim + 0.36 * artist_sim + 0.12 * format_score + tie_breaker,
+        label_catno_matched = _matches_label_catno(norm, release)
+        artist_ok_for_catno = (
+            (norm.is_compilation and artist_sim >= 0.55)
+            or (not norm.is_compilation and (not norm.artist_norm or artist_sim >= 0.55))
         )
+        if label_catno_matched and artist_ok_for_catno:
+            score = min(
+                1.0,
+                0.72 + 0.15 * artist_sim + 0.08 * format_score + tie_breaker,
+            )
+        else:
+            if norm.is_compilation and title_sim < 0.65:
+                rejection_reasons.append(
+                    f"Release {release.discogs_release_id} compilation title similarity too low ({title_sim:.2f})."
+                )
+            elif not norm.is_compilation and (
+                title_sim < 0.55 or (norm.artist_norm and artist_sim < 0.55)
+            ):
+                rejection_reasons.append(
+                    f"Release {release.discogs_release_id} rejected (title_sim={title_sim:.2f}, artist_sim={artist_sim:.2f})."
+                )
+            score = min(
+                1.0,
+                0.52 * title_sim + 0.36 * artist_sim + 0.12 * format_score + tie_breaker,
+            )
 
     passed = not rejection_reasons and score >= 0.65
     if not passed and not rejection_reasons:

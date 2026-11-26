@@ -12,21 +12,22 @@ Every run returns an honest status instead of guessing: `matched` (confident mat
 
 ```mermaid
 flowchart TD
-    Entry["Entry Point: REST API (main.py) or CLI (cli.py)"] --> Norm["1. Normalize Input (normalizer.py)"]
+    Entry["Entry Point: REST API / Dashboard (main.py, dashboard.py) or CLI (cli.py)"] --> Norm["1. Normalize Input (normalizer.py)"]
     Norm --> SaveIn["2. Save Input Record (repository.py -> input_records)"]
     SaveIn --> DbCheck{"3. Already in local DB? (Layers 1 & 2)"}
     DbCheck -- "Fresh 200 match" --> ReturnDB["Return 200 OK (source: database)"]
     DbCheck -- "404 within TTL" --> Return404Cache["Return 404 Not Found (source: database_cache)"]
     DbCheck -- "Miss or force_refresh" --> Discogs["4. 3-Tier Discogs Search & Fetch (discogs_client.py + api_cache)"]
-    Discogs -- "Upstream error (401 / 429 / 5xx)" --> Fallback{"Stored DB backup exists?"}
-    Fallback -- "Yes" --> ReturnFB["Return 200 OK (source: database_fallback + warning)"]
-    Fallback -- "No" --> ReturnErr["Log upstream_error -> Return 502 / 503"]
-    Discogs -- "Candidates fetched" --> Extract["5. Extract Tracks, Discs & Credits (extractor.py)"]
-    Extract --> SaveRel["6. Save Canonical Release (releases, tracks, credits)"]
-    SaveRel --> Eval["7. Score & Compare Editions (evaluator.py)"]
-    Eval -- "Clear match" --> OutMatch["Log & Return 200 OK (status: matched)"]
-    Eval -- "Ambiguous or gaps" --> OutReview["Log & Return 200 OK (status: needs_review + alternatives)"]
-    Eval -- "0 passing candidates" --> Out404["Log & Return 404 Not Found (status: not_found)"]
+    Discogs -- "Matched release" --> Extract["5. Extract & Evaluate (extractor.py, evaluator.py)"]
+    Discogs -- "Not found / error" --> ExtFB["6. External Fallbacks: MusicBrainz / JPC / Deezer / iTunes (fallback_providers.py)"]
+    ExtFB -- "Matched release" --> Extract
+    ExtFB -- "Exhausted" --> AgentFB["7. Optional Gemini + Google Search Agent Fallback (agent_client.py)"]
+    AgentFB -- "Discogs URL bridge" --> Extract
+    AgentFB -- "Verified answer" --> SaveFB["Save Agent Fallback (agent_fallbacks, agent_fallback_tracks)"]
+    AgentFB -- "No match / unconfigured" --> Out404["Return 404 Not Found or 502/503 (if no DB backup)"]
+    Extract --> Enrich["8. 5-Tier Track Enrichment: Tier 0 -> 1 -> 2a -> 2b -> opt-in Tier 3 Gemini (enricher.py)"]
+    SaveFB --> Enrich
+    Enrich --> OutMatch["Persist Provenance + Coverages & Return 200 (matched / needs_review)"]
 ```
 
 ---
@@ -35,20 +36,25 @@ flowchart TD
 
 | Component / File | Layer | What It Does in One Sentence |
 | --- | --- | --- |
-| [docker-compose.yml](../docker-compose.yml) | Infrastructure | Starts the PostgreSQL 16 database and FastAPI container together with persistent storage and volume mounts. |
-| [.env.example](../.env.example) | Infrastructure | Template listing the environment variables (Discogs token, DB credentials, ports, cache limits) used by the stack. |
-| [Dockerfile](pipeline/Dockerfile) & [requirements.txt](pipeline/requirements.txt) | Infrastructure | Packages the Python 3.12 runtime and pinned dependencies (`fastapi`, `uvicorn`, `httpx`, `psycopg`, `pydantic`, `pytest`). |
-| [config.py](pipeline/app/config.py) | Infrastructure | Loads environment settings (DB URL, Discogs token, rate-limit floor, timeouts, TTL) into a cached `Settings` object. |
-| [main.py](pipeline/app/main.py) | Entry Point | Runs the FastAPI web server, interactive Swagger UI (`/docs`), and JSON endpoints for single, batch, and DB inspection calls. |
-| [cli.py](pipeline/app/cli.py) | Entry Point | Provides `python -m app.cli` commands (`lookup` and `batch`) for terminal runs and automated scripts. |
-| [models.py](pipeline/app/models.py) | Data Models | Defines strict Pydantic schemas for input validation, tracks, credits, evaluation metrics, API responses, and batch reports. |
-| [normalizer.py](pipeline/app/normalizer.py) | Core Logic | Cleans barcodes, artist names, titles, and format tags (`(2CD)`, `RSD`, `Various`) and hashes them into a deduplication key. |
-| [service.py](pipeline/app/service.py) | Core Logic | Orchestrates the full lookup lifecycle: DB deduplication, 3-tier Discogs search, offline fallback, and CSV batch reporting. |
-| [discogs_client.py](pipeline/app/discogs_client.py) | Core Logic | Talks to Discogs REST API v2 behind a swappable `CatalogProvider` interface with DB caching, rate pacing, retries, and typed errors. |
-| [extractor.py](pipeline/app/extractor.py) | Core Logic | Parses raw Discogs release JSON into ordered multi-disc tracks, resolved performers, separated credit buckets, and a `tracklist_hash`. |
-| [evaluator.py](pipeline/app/evaluator.py) | Core Logic | Scores candidate releases, rejects bad matches, checks whether competing editions disagree on tracks, and audits track metadata quality. |
-| [init.sql](pipeline/sql/init.sql) & [repository.py](pipeline/app/repository.py) | Storage | Defines the 8-table PostgreSQL schema and runs all connection-pooled queries, upserts, and inspection lookups. |
-| [tests/](pipeline/tests/) | Tests | Houses 23 unit and PostgreSQL integration tests (`pytest`) covering normalization, extraction, scoring, HTTP retries, and end-to-end flows. |
+| [docker-compose.yml](../docker-compose.yml) | Infrastructure | Starts the PostgreSQL 16 database and FastAPI container together with persistent storage, queue/enrichment env defaults, and volume mounts. |
+| [.env.example](../.env.example) | Infrastructure | Template listing Discogs, Gemini, fallback, worker queue, and idle auto-enrichment environment variables. |
+| [Dockerfile](pipeline/Dockerfile) & [requirements.txt](pipeline/requirements.txt) | Infrastructure | Packages Python 3.12 and dependencies (`fastapi`, `uvicorn`, `httpx`, `psycopg`, `pydantic`, `google-genai`, `pytest`). |
+| [config.py](pipeline/app/config.py) | Infrastructure | Loads environment settings (DB, Discogs, Gemini, fallbacks, worker concurrency, track enrichment, idle auto-sweep) into a cached `Settings` object. |
+| [main.py](pipeline/app/main.py) | Entry Point | Runs the FastAPI server, Swagger UI (`/docs`), HTML dashboard routes, REST lookup/batch/review endpoints, and async `/jobs/*` queue API. |
+| [dashboard.py](pipeline/app/dashboard.py) | Entry Point | Renders interactive `/results`, `/results/{input_id}` (with `Featured` credits and provenance tags), and `/queue` dashboards with opt-in `Allow Gemini` controls. |
+| [cli.py](pipeline/app/cli.py) | Entry Point | Provides `python -m app.cli` commands (`lookup`, `batch`, `enqueue-batch`, `retry-not-found`, `enrich`, `enqueue-enrich`) for terminal and script workflows. |
+| [models.py](pipeline/app/models.py) | Data Models | Defines strict Pydantic schemas for validation, tracks, credits, provenance, evaluation metrics, queue status (`idle_auto_enrichment_enabled`), and token/cost accounting. |
+| [normalizer.py](pipeline/app/normalizer.py) | Core Logic | Cleans barcodes, artist names, titles, format tags (`(2CD)`, `RSD`, `Various`), and label/catno hints, hashing them into a deduplication key. |
+| [service.py](pipeline/app/service.py) | Core Logic | Orchestrates DB deduplication, Discogs 3-tier lookup, external/agent fallbacks, track enrichment persistence, and atomic JSON/Markdown batch reports (`ISRC Cov` + live coverages). |
+| [discogs_client.py](pipeline/app/discogs_client.py) | Core Logic | Talks to Discogs REST API v2 behind `CatalogProvider` with PostgreSQL `api_cache`, master version queries, rate pacing, retries, and typed errors. |
+| [fallback_providers.py](pipeline/app/fallback_providers.py) | Core Logic | Implements MusicBrainz, JPC, Deezer, and iTunes album fallbacks (mapped into canonical negative-ID releases) between Discogs and Gemini. |
+| [agent_client.py](pipeline/app/agent_client.py) | Core Logic | Runs optional Gemini + Google Search two-pass structured album fallback and batched missing-track enrichment with usage token and cost tracking. |
+| [enricher.py](pipeline/app/enricher.py) | Core Logic | Runs 5-tier provenance-tracked track enrichment (`Tier 0 -> 1 -> 2a -> 2b -> opt-in Tier 3`), using unquoted Deezer track queries, base-title parenthetical fallback, live-release guards, and >25-track Gemini chunking. |
+| [queue_worker.py](pipeline/app/queue_worker.py) | Core Logic | Runs 3 PostgreSQL worker pools (`queued_discogs` -> `queued_agent` -> `queued_enrich`), crash recovery, and Idle-Queue Auto-Enrichment (`track_enrich_auto`). |
+| [extractor.py](pipeline/app/extractor.py) | Core Logic | Parses raw Discogs/fallback JSON into ordered multi-disc tracks, resolved performers, separated credit buckets (`composers`, `lyricists`, `producers`, `featured`, `other`), and `tracklist_hash`. |
+| [evaluator.py](pipeline/app/evaluator.py) | Core Logic | Scores candidate releases, rejects bad matches, checks whether competing editions disagree on tracks, and computes match confidence & track coverage metrics. |
+| [init.sql](pipeline/sql/init.sql) & [repository.py](pipeline/app/repository.py) | Storage | Defines the 13-table PostgreSQL schema with idempotent migrations and runs pooled queries, enrichment token/cost tracking, reviews, and atomic job transitions. |
+| [tests/](pipeline/tests/) | Tests | Houses 61 unit and PostgreSQL integration tests (`pytest`) across 10 modules covering every stage, worker pool, enricher tier, and dashboard UI. |
 
 ---
 
@@ -59,27 +65,27 @@ flowchart TD
 - **[docker-compose.yml](../docker-compose.yml) & [.env.example](../.env.example)**:
   - Runs two containers: `db` (`postgres:16-alpine` with a persistent `pgdata` volume, a `pg_isready` healthcheck, and automatic schema initialization from [init.sql](pipeline/sql/init.sql) on first boot) and `api` (exposed on port `8000` by default).
   - Mounts `./data` read-only at `/app/data` (for [development.csv](../data/development.csv)) and `./outputs` at `/app/outputs` (so generated batch reports appear directly on your host machine).
-  - Reads settings from `.env` (see [.env.example](../.env.example)): `DISCOGS_TOKEN`, `DISCOGS_USER_AGENT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT`, `API_PORT`, `NOT_FOUND_TTL_HOURS` (`24`), and `MAX_CANDIDATES_TO_FETCH` (`4`).
+  - Reads settings from `.env` (see [.env.example](../.env.example)): Discogs (`DISCOGS_TOKEN`, `DISCOGS_USER_AGENT`), Gemini (`GEMINI_API_KEY`, `GOOGLE_GENAI_MODEL`, `ENABLE_AGENT_FALLBACK`), PostgreSQL, queue worker concurrency (`DISCOGS_QUEUE_CONCURRENCY`, `AGENT_QUEUE_CONCURRENCY`, `ENRICH_QUEUE_CONCURRENCY`), and enrichment controls (`ENABLE_TRACK_ENRICHMENT`, `ENABLE_AGENT_TRACK_ENRICHMENT`, `ENABLE_IDLE_AUTO_ENRICHMENT`, `IDLE_ENRICHMENT_INTERVAL_SEC`, `IDLE_ENRICHMENT_BATCH_SIZE`).
 - **[Dockerfile](pipeline/Dockerfile) & [requirements.txt](pipeline/requirements.txt)**:
-  - Builds a slim Python 3.12 image containing `app/`, `sql/`, and `tests/`, installs FastAPI, Uvicorn, HTTPX, `psycopg[binary,pool]`, Pydantic Settings, and `pytest`, and launches `uvicorn app.main:app` on port `8000`.
+  - Builds a slim Python 3.12 image containing `app/`, `sql/`, and `tests/`, installs FastAPI, Uvicorn, HTTPX, `psycopg[binary,pool]`, Pydantic Settings, `google-genai`, and `pytest`, and launches `uvicorn app.main:app` on port `8000`.
 - **[config.py](pipeline/app/config.py)**:
-  - Defines the Pydantic `Settings` class (cached via `@lru_cache`) with defaults for `database_url`, `discogs_token`, `discogs_user_agent` (`"LMUTracklistHackathon/1.0"`), `not_found_ttl_hours` (`24`), `max_candidates_to_fetch` (`4`), `discogs_timeout_sec` (`15.0`), `discogs_min_remaining` (`5`), and `discogs_base_url` (`"https://api.discogs.com"`).
+  - Defines the Pydantic `Settings` class (cached via `@lru_cache`) for DB, Discogs, external fallbacks, Gemini fallback/enrichment, queue concurrency, idle auto-sweep intervals, and rate limits.
 
 ### Entry Points (How You Run It)
 
-- **Web API — [main.py](pipeline/app/main.py)**:
-  - Uses FastAPI's `lifespan` hook to open a `psycopg_pool.ConnectionPool`, ensure the PostgreSQL schema exists (`repo.ensure_schema()`), instantiate `DiscogsClient` + `LookupService`, and clean them up on shutdown. Interactive docs are served automatically at `/docs`.
-  - **Endpoints:**
-    - `GET /health` — Pings PostgreSQL and checks if `DISCOGS_TOKEN` is configured (returns `status: "ok"` or `"degraded"` if the DB is unreachable).
-    - `POST /lookup` — Runs a single release lookup; returns `200` (`matched` / `needs_review`), `404` (`not_found`), `422` (invalid request), `502` (Discogs auth/network/5xx outage without backup), or `503` (Discogs rate-limit outage without backup).
-    - `POST /batch/csv` — Runs selected or all rows from a CSV file (default `/app/data/development.csv`), writes JSON and Markdown reports, and returns summary counts.
-    - `GET /records` (`limit` 1–500, default `100`) — Lists stored input records with their latest lookup outcome.
-    - `GET /records/{input_id}` — Shows full details for one input: run history, ranked candidate matches, selected release, and tracks.
-    - `GET /releases/{discogs_release_id}` — Returns a stored canonical release and its extracted tracks/credits directly from PostgreSQL.
+- **Web API & Dashboards — [main.py](pipeline/app/main.py) & [dashboard.py](pipeline/app/dashboard.py)**:
+  - Uses FastAPI's `lifespan` hook to open a `psycopg_pool.ConnectionPool`, run idempotent schema migrations (`repo.ensure_schema()`), start `QueueManager` workers (when `ENABLE_QUEUE_WORKERS=true`), and serve Swagger UI at `/docs`.
+  - **HTML Dashboards:**
+    - `GET /results` & `GET /results/{input_id}` — Interactive record browser and track/credit inspector showing provenance tags (`[musicbrainz]`, `[deezer]`, `[itunes]`, `[gemini_agent]`), ISRCs, `Featured` credits, human/agent reviews, single/bulk `Enrich Missing` controls with opt-in `Allow Gemini`, and Gemini retries.
+    - `GET /queue` — Live-polling 3-pool queue monitor (`Discogs`, `Agent`, `Enrich`, plus `Idle:on/off` indicator), single-lookup enqueue form, bulk agent retry, bulk enrichment (`Allow Gemini`), and per-job item inspector/cancellation.
+  - **JSON Endpoints:**
+    - `GET /health`, `POST /lookup`, `POST /batch/csv`, `GET /records`, `GET /records/{input_id}`, `POST /records/{input_id}/review`, `GET /releases/{discogs_release_id}`.
+    - Sync & Async Enrichment/Queue: `POST /records/{input_id}/enrich`, `POST /records/enrich-missing`, `POST /jobs/batch`, `POST /jobs/lookup`, `POST /jobs/agent-retry/{input_id}`, `POST /jobs/retry-not-found`, `POST /jobs/enrich/{input_id}`, `POST /jobs/enrich-missing`, `GET /jobs/status`, `GET /jobs`, `GET /jobs/{job_id}`, and `POST /jobs/{job_id}/cancel`.
 - **Command Line Interface — [cli.py](pipeline/app/cli.py)**:
-  - Invoked via `python -m app.cli` with the same `LookupService` and database backend (plus an optional injectable `provider` for testing):
-    - `lookup --barcode ... --title ... --artist ... [--refresh]` — Prints JSON to stdout and exits with `0` (`matched`/`needs_review`), `1` (`not_found`), or `2` (`upstream_error`).
-    - `batch --csv ... [--rows 1,3,7,13,16] [--output /app/outputs/batch_report.json] [--refresh]` — Runs a CSV batch and prints the `BatchSummaryResponse` JSON.
+  - Invoked via `python -m app.cli` with the same `LookupService` and PostgreSQL backend:
+    - `lookup --barcode ... --title ... --artist ... [--refresh]` (`0` = matched/needs_review, `1` = not_found, `2` = upstream_error)
+    - `batch --csv ... [--rows 1,3,7,13,16] [--output /app/outputs/batch_report.json] [--refresh]`
+    - `enqueue-batch`, `retry-not-found`, `enrich --input-id ... | --all-missing [--use-agent] [--refresh]`, and `enqueue-enrich` (`--input-id ... | --all-missing [--use-agent]`).
 
 ### Data Contracts
 
@@ -149,47 +155,73 @@ Decides which fetched releases are valid matches, picks the best edition, and fl
   - Also appends `review_reasons` (triggering `needs_review`) when a supplied barcode wasn't confirmed, Discogs `data_quality` is poor, any track lacks a resolved performer, inferred disc count mismatches format quantity, or requested format tags aren't confirmed.
   - Computes coverage metrics: `duration_coverage`, `performer_coverage`, `writer_credit_coverage`, and `producer_credit_coverage`.
 
+#### 6. Fallbacks, Track Enrichment & Worker Queues — [fallback_providers.py](pipeline/app/fallback_providers.py), [agent_client.py](pipeline/app/agent_client.py), [enricher.py](pipeline/app/enricher.py), [queue_worker.py](pipeline/app/queue_worker.py)
+
+- **External & Gemini Fallbacks:** If Discogs misses or errors, `LookupService` tries deterministic catalog fallbacks (MusicBrainz, JPC, Deezer, iTunes) before falling back to optional Gemini + Google Search (`ENABLE_AGENT_FALLBACK`). If Gemini discovers a verified Discogs release URL, it bridges back to extract canonical tracks and credits.
+- **5-Tier Track Enrichment (`TrackEnricher`):**
+  - **Tier 0:** Deterministic album-artist inheritance onto unresolved compilation/single-act performers (`is_resolved_artist_name`) and raw duration formatting.
+  - **Tier 1:** Sibling candidate releases and Discogs `master` CD/Digital/File versions with strict title alignment and `tracklist_hash` immutability.
+  - **Tier 2a:** Album-level donor fill via MusicBrainz, Deezer (UPC then unquoted `"{artist} {title}"` search), and iTunes.
+  - **Tier 2b:** Per-track compilation/studio fill via Deezer (`/search/track` using unquoted `"{artist} {title}"` + parenthetical-stripped base-title fallback while validating strictly against the original title, plus `/track/{id}` for ISRCs), iTunes, and MusicBrainz. Blocked automatically on live releases (checked across title, input title, formats, format tags, and `release.notes`).
+  - **Tier 3 (opt-in `use_agent=True`):** Batched Gemini + Google Search in chunks of up to 25 missing tracks per request, accumulating token counts and cost onto `releases` (`enrichment_*`) and `agent_fallbacks`.
+- **3-Pool PostgreSQL Worker Queue & Idle Auto-Enrichment (`QueueManager`):**
+  - Runs dedicated `discogs-*`, `agent-*`, and `enrich-*` threads over `queued_discogs` -> `queued_agent` -> `queued_enrich`, recovering stale `checking_*` items cleanly after restarts and writing atomic JSON/Markdown batch reports (with `Confidence`, `Duration Cov`, `Performer Cov`, `Writer Cov`, and `ISRC Cov`) before flipping `queue_jobs.status` to `completed`.
+  - When `ENABLE_IDLE_AUTO_ENRICHMENT=true` and `is_queue_idle()` is `True`, worker `enrich-1` sweeps up to `IDLE_ENRICHMENT_BATCH_SIZE` (`10`) un-enriched (`enriched_at IS NULL`) matched records every `IDLE_ENRICHMENT_INTERVAL_SEC` (`15.0`s) into a background `job_type="track_enrich_auto"` job (free Tiers 0–2b only, `use_agent=false`).
+
 ---
 
 ### Storage Layer — [init.sql](pipeline/sql/init.sql) & [repository.py](pipeline/app/repository.py)
 
-`PipelineRepository` wraps a `psycopg_pool.ConnectionPool` to run idempotent upserts and queries across **8 PostgreSQL tables**:
+`PipelineRepository` wraps a `psycopg_pool.ConnectionPool` to run idempotent upserts and queries across **13 PostgreSQL tables** (plus idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migrations for provenance and enrichment billing):
 
 | Table | Purpose |
 | --- | --- |
 | `input_records` | Stores raw and normalized request fields, `format_hint`, `is_compilation`, and unique `input_hash`. |
-| `releases` | Stores canonical Discogs release metadata (`discogs_release_id` PK), `tracklist_hash`, `unscoped_credits_json`, and full `raw_json`. |
+| `releases` | Stores canonical Discogs/fallback release metadata (`discogs_release_id` PK), `tracklist_hash`, `enriched_at`, `enrichment_*` Gemini token/cost counters, and `raw_json`. |
 | `release_barcodes` | Indexes every normalized barcode (and UPC/EAN variant) per release for fast local lookups. |
-| `tracks` | Ordered tracks (`disc_number`, `position`, `entry_type`, `parent_position`, `title`, `duration_sec`, `performing_artists_json`). |
-| `track_credits` | Normalized per-track credits separated by `role_category` and `credit_source` (`track`, `release_all`, `release_range`). |
+| `tracks` | Ordered tracks (`disc_number`, `position`, `entry_type`, `parent_position`, `title`, `duration_sec`, `performing_artists_json`, `isrc`, per-field provenance columns, and `enrichment_notes_json`). |
+| `track_credits` | Normalized per-track credits separated by `role_category` (`composer`, `lyricist`, `producer`, `featured`, `other`), `credit_source`, and `source_url`. |
 | `input_matches` | Links an `input_record` to ranked candidate `releases` with scores, `is_selected`, and evaluation details. |
-| `lookup_runs` | Append-only audit log of every lookup attempt (`status`, `http_code`, `source`, queries tried, review reasons, `error_detail`). |
-| `api_cache` | Caches raw HTTP `200` JSON responses from Discogs keyed by SHA-256 of `(endpoint, params)`. |
+| `agent_fallbacks` | Stores Gemini agent answers, sources, `enriched_at`, and cumulative input/output token counts + `cost_usd`. |
+| `agent_fallback_tracks` | Ordered tracks, durations, performers, credits (`credits_json`), ISRCs, and provenance fields extracted for Gemini agent matches. |
+| `lookup_runs` | Append-only audit log of every lookup attempt (`status`, `http_code`, `source`, evaluation coverages, review reasons, `error_detail`). |
+| `api_cache` | Caches raw HTTP `200` JSON responses from Discogs, MusicBrainz, Deezer, iTunes, and JPC keyed by SHA-256 of `(endpoint, params)`. |
+| `record_reviews` | Stores human/agent `confirm`, `deny`, and `request_review` review decisions and audit history. |
+| `queue_jobs` | Tracks async batch, lookup, retry, manual enrichment (`track_enrich`), and idle auto-enrichment (`track_enrich_auto`) jobs, counts, and report paths. |
+| `queue_items` | Tracks per-row async work across `queued_discogs`, `checking_discogs`, `queued_agent`, `checking_agent`, `queued_enrich`, `checking_enrich`, `done`, and `cancelled`. |
 
 ```mermaid
 erDiagram
     input_records ||--o{ lookup_runs : "logs runs"
     input_records ||--o{ input_matches : "ranks candidates"
+    input_records ||--o{ record_reviews : "has reviews"
+    queue_jobs ||--o{ queue_items : "contains items"
     releases ||--o{ input_matches : "matched as"
     releases ||--o{ lookup_runs : "selected in"
     releases ||--o{ release_barcodes : "has barcodes"
     releases ||--o{ tracks : "contains"
     tracks ||--o{ track_credits : "has credits"
+    agent_fallbacks ||--o{ agent_fallback_tracks : "contains"
 ```
 
 ---
 
 ### Automated Test Suite — [tests/](pipeline/tests/)
 
-The suite runs via `pytest` (23 tests across 5 modules plus shared fixtures in [conftest.py](pipeline/tests/conftest.py)):
+The suite runs via `pytest` (**61 tests** across **10 modules** plus shared fixtures in [conftest.py](pipeline/tests/conftest.py)):
 
 | Test File | Tests | What It Verifies |
 | --- | --- | --- |
-| [test_normalizer.py](pipeline/tests/test_normalizer.py) | 5 | Normalizes all 25 rows of [development.csv](../data/development.csv), barcode sanitization & UPC/EAN variants, artist un-inversion & compilations, `;` prefix/format extraction, `input_hash` stability, and `LookupRequest` rejection of empty/`"0"` inputs. |
-| [test_extractor.py](pipeline/tests/test_extractor.py) | 5 | Duration & comma/bracket role parsing, multi-disc headings/prefixes/vinyl sides/implicit resets/`"V1"` safety, `sub_tracks` credit & disc merging, release-level credit range selectors + unscoped fallback, and artist `join`/`anv`. |
-| [test_evaluator.py](pipeline/tests/test_evaluator.py) | 4 | `matched` vs. `clear_winner` scoring, `needs_review` on diverging editions, empty-tracklist & barcode-collision rejections, and quality/disc-mismatch/unconfirmed-barcode review flags. |
+| [test_normalizer.py](pipeline/tests/test_normalizer.py) | 6 | Normalizes all 25 rows of [development.csv](../data/development.csv), barcode sanitization & UPC/EAN variants, artist un-inversion & compilations, `;` prefix/format/label-catno hints, `input_hash` stability, and `LookupRequest` validation. |
+| [test_extractor.py](pipeline/tests/test_extractor.py) | 5 | Duration & role parsing, multi-disc headings/prefixes/vinyl sides/`"V1"` safety, `sub_tracks` credit & disc merging, release-level credit range selectors + unscoped fallback, and artist `join`/`anv`. |
+| [test_evaluator.py](pipeline/tests/test_evaluator.py) | 5 | `matched` vs. `clear_winner` scoring, `needs_review` on diverging editions, empty-tracklist & barcode-collision rejections, label/catno matching, and quality/disc-mismatch/unconfirmed-barcode review flags. |
 | [test_discogs_client.py](pipeline/tests/test_discogs_client.py) | 3 | Uses `httpx.MockTransport` to verify missing-token checks, required headers, `api_cache` hit/bypass, `429`/`5xx`/network retries, `401`/`404` handling, and invalid JSON errors. |
+| [test_agent_client.py](pipeline/tests/test_agent_client.py) | 7 | JSON fence parsing, Discogs release URL extraction & dedup, track dedup/sorting, two-pass Gemini grounding mocks, token usage & cost calculation, and retry/error behavior. |
+| [test_fallback_providers.py](pipeline/tests/test_fallback_providers.py) | 4 | Deterministic negative IDs, JPC multi-disc HTML parsing & caching, network error isolation, and iTunes album search pre-filtering. |
+| [test_enricher.py](pipeline/tests/test_enricher.py) | 11 | Live/version qualifier guards, Discogs master/MusicBrainz/Deezer/iTunes enrichment, unquoted Deezer track & parenthetical base-title fallback, >25-track Gemini chunking & token/cost billing, `queued_enrich` recovery & cancellation, queued report live coverages & `Featured`/`Allow Gemini` UI, and idle-queue `track_enrich_auto` sweep. |
 | [test_end_to_end.py](pipeline/tests/test_end_to_end.py) | 6 | Full PostgreSQL + FastAPI + CLI integration: real `DiscogsClient` + `api_cache` + UPC/EAN dedup, Tier 1 empty stub fallback to Tier 2/3, `404` TTL caching & expiry, offline DB fallback (`200`) vs. `502`/`503` outages, validation/route errors + degraded `/health`, and `/batch/csv` + CLI exit codes (`0`/`1`/`2`). |
+| [test_agent_fallback_e2e.py](pipeline/tests/test_agent_fallback_e2e.py) | 7 | End-to-end external fallback ordering, Gemini agent DB cache hits, Discogs URL bridge, double failure handling, dashboard review workflows, and mixed batch/CLI execution. |
+| [test_queue_e2e.py](pipeline/tests/test_queue_e2e.py) | 7 | Two-stage async batch queue, parallel agent workers, external fallback handoff & atomic report outputs, duplicate `409` guards, job cancellation, crash recovery, `/queue` UI, and queue CLI commands. |
 
 ---
 

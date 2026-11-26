@@ -19,3 +19,4 @@ slides/dist/
 slides/.slidev/
 slides/slides.pdf
 /api_token_discogs.md
+.idea/

@@ -1,13 +1,19 @@
 import csv
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from psycopg_pool import ConnectionPool
 
-from app.agent_client import AgentFallbackProvider, GeminiAgentClient
+from app.agent_client import (
+    AgentFallbackProvider,
+    AzureOpenAIAgentClient,
+    GeminiAgentClient,
+    build_agent_client,
+)
 from app.config import Settings, get_settings
 from app.dashboard import (
     render_queue_dashboard,
@@ -15,10 +21,14 @@ from app.dashboard import (
     render_results_table,
 )
 from app.discogs_client import DiscogsClient
+from app.enricher import TrackEnricher, build_default_track_enricher
 from app.extractor import extracted_track_to_out
+from app.fallback_providers import FallbackProvider, build_default_fallback_providers
 from app.models import (
     BatchRequest,
     BatchSummaryResponse,
+    EnrichRecordResponse,
+    EnrichRequest,
     EnqueueLookupRequest,
     HealthResponse,
     LookupNotFoundResponse,
@@ -30,6 +40,7 @@ from app.models import (
     RecordDetailOut,
     RecordSummaryOut,
     ReleaseOut,
+    RestartDemoRequest,
     ReviewOut,
     ReviewRequest,
 )
@@ -49,17 +60,54 @@ def _build_queue_status(
         recent_jobs=recent_jobs,
         discogs_workers=qm.discogs_worker_count,
         agent_workers=qm.agent_worker_count,
+        enrich_workers=qm.enrich_worker_count,
         workers_running=qm.is_running,
         agent_configured=service.has_agent_fallback(),
+        idle_auto_enrichment_enabled=qm.idle_auto_enrichment_enabled,
     )
+
+
+def _load_csv_queue_items(
+    csv_path: str, rows: list[int] | None = None, force_refresh: bool = False
+) -> tuple[Path, list[dict[str, Any]]]:
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        raise HTTPException(status_code=404, detail=f"CSV file not found: {csv_file}")
+
+    with csv_file.open("r", encoding="utf-8-sig", newline="") as handle:
+        all_rows = list(csv.DictReader(handle))
+
+    selected_indices = (
+        set(rows) if rows else set(range(1, len(all_rows) + 1))
+    )
+    items: list[dict[str, Any]] = []
+    for idx, row in enumerate(all_rows, start=1):
+        if idx not in selected_indices:
+            continue
+        items.append(
+            {
+                "row_number": idx,
+                "barcode": str(row.get("barcode") or ""),
+                "album_title": str(row.get("album_title") or ""),
+                "album_artist": str(row.get("album_artist") or ""),
+                "force_refresh": force_refresh,
+                "mode": "full",
+                "stage": "queued_discogs",
+                "status_message": "Queued for Discogs",
+            }
+        )
+    return csv_file, items
 
 
 def create_app(
     settings: Settings | None = None,
     provider: Any | None = None,
     agent_provider: AgentFallbackProvider | None = None,
+    fallback_providers: list[FallbackProvider] | None = None,
+    enricher: TrackEnricher | None = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
+    restart_lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -73,17 +121,42 @@ def create_app(
             client = DiscogsClient(cfg, cache_store=repo)
             active_provider = client
 
-        own_agent_client: GeminiAgentClient | None = None
+        own_agent_client: GeminiAgentClient | AzureOpenAIAgentClient | None = None
         active_agent_provider = agent_provider
-        if active_agent_provider is None and cfg.is_agent_configured():
-            own_agent_client = GeminiAgentClient(cfg)
+        if active_agent_provider is None:
+            own_agent_client = build_agent_client(cfg)
             active_agent_provider = own_agent_client
+
+        own_fallbacks: list[FallbackProvider] = []
+        if fallback_providers is not None:
+            active_fallbacks = list(fallback_providers)
+        elif provider is None:
+            own_fallbacks = build_default_fallback_providers(cfg, cache_store=repo)
+            active_fallbacks = own_fallbacks
+        else:
+            active_fallbacks = []
+
+        own_enricher: TrackEnricher | None = None
+        if enricher is not None:
+            active_enricher: TrackEnricher | None = enricher
+        elif provider is None and cfg.enable_track_enrichment:
+            own_enricher = build_default_track_enricher(
+                cfg,
+                active_provider,
+                cache_store=repo,
+                agent_provider=active_agent_provider,
+            )
+            active_enricher = own_enricher
+        else:
+            active_enricher = None
 
         service = LookupService(
             repo=repo,
             provider=active_provider,
             settings=cfg,
             agent_provider=active_agent_provider,
+            fallback_providers=active_fallbacks,
+            enricher=active_enricher,
         )
         queue_manager = QueueManager(repo=repo, service=service, settings=cfg)
 
@@ -100,6 +173,10 @@ def create_app(
             yield
         finally:
             queue_manager.stop(timeout=5.0)
+            if own_enricher is not None:
+                own_enricher.close()
+            for fb in own_fallbacks:
+                fb.close()
             if own_agent_client is not None:
                 own_agent_client.close()
             if client is not None:
@@ -197,32 +274,9 @@ def create_app(
 
     @app.post("/jobs/batch", status_code=202, response_model=QueueJobOut)
     def enqueue_batch_job(payload: BatchRequest, request: Request) -> QueueJobOut:
-        csv_file = Path(payload.csv_path)
-        if not csv_file.exists():
-            raise HTTPException(status_code=404, detail=f"CSV file not found: {csv_file}")
-
-        with csv_file.open("r", encoding="utf-8-sig", newline="") as handle:
-            all_rows = list(csv.DictReader(handle))
-
-        selected_indices = (
-            set(payload.rows) if payload.rows else set(range(1, len(all_rows) + 1))
+        csv_file, items = _load_csv_queue_items(
+            payload.csv_path, rows=payload.rows, force_refresh=payload.force_refresh
         )
-        items: list[dict[str, Any]] = []
-        for idx, row in enumerate(all_rows, start=1):
-            if idx not in selected_indices:
-                continue
-            items.append(
-                {
-                    "row_number": idx,
-                    "barcode": str(row.get("barcode") or ""),
-                    "album_title": str(row.get("album_title") or ""),
-                    "album_artist": str(row.get("album_artist") or ""),
-                    "force_refresh": payload.force_refresh,
-                    "mode": "full",
-                    "stage": "queued_discogs",
-                    "status_message": "Queued for Discogs",
-                }
-            )
 
         repo: PipelineRepository = request.app.state.repo
         qm: QueueManager = request.app.state.queue_manager
@@ -237,6 +291,49 @@ def create_app(
         if items:
             qm.notify_discogs()
         return job
+
+    @app.post("/jobs/restart-demo", status_code=202, response_model=QueueJobOut)
+    def restart_demo_batch(
+        request: Request,
+        payload: RestartDemoRequest | None = Body(default=None),
+    ) -> QueueJobOut:
+        req = payload or RestartDemoRequest()
+        csv_file, items = _load_csv_queue_items(
+            req.csv_path, rows=None, force_refresh=req.clear_api_cache
+        )
+        if not items:
+            raise HTTPException(status_code=400, detail="CSV file contains no rows.")
+
+        repo: PipelineRepository = request.app.state.repo
+        qm: QueueManager = request.app.state.queue_manager
+        if not restart_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="Restart already in progress.")
+
+        try:
+            was_running = qm.is_running
+            if was_running:
+                stopped = qm.stop(timeout=15.0)
+                if not stopped:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Workers are still finishing an active upstream request; please try again in a few seconds.",
+                    )
+
+            repo.reset_pipeline_state(clear_api_cache=req.clear_api_cache)
+            job = repo.create_queue_job(
+                job_type="batch_csv",
+                label=f"Demo Restart: {csv_file.name} ({len(items)} songs)",
+                items=items,
+                csv_path=req.csv_path,
+                output_path=req.output_path,
+                force_refresh=req.clear_api_cache,
+            )
+            if was_running:
+                qm.start()
+                qm.notify_discogs()
+            return job
+        finally:
+            restart_lock.release()
 
     @app.post("/jobs/lookup", status_code=202, response_model=QueueJobDetailOut)
     def enqueue_lookup_job(
@@ -368,6 +465,150 @@ def create_app(
         if items:
             qm.notify_agent()
         return job
+
+    @app.post("/jobs/enrich/{input_id}", status_code=202, response_model=QueueJobDetailOut)
+    def enqueue_enrich_record(
+        input_id: int,
+        request: Request,
+        payload: EnrichRequest | None = Body(default=None),
+    ) -> QueueJobDetailOut:
+        req = payload or EnrichRequest()
+        repo: PipelineRepository = request.app.state.repo
+        service: LookupService = request.app.state.service
+        qm: QueueManager = request.app.state.queue_manager
+
+        rec = repo.get_input_record(input_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Input record {input_id} not found.")
+        latest = repo.find_latest_run(input_id)
+        if latest is None or latest["status"] not in ("matched", "needs_review"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input record {input_id} has no matched/needs_review result to enrich.",
+            )
+        if (
+            latest.get("selected_release_id") is None
+            and latest.get("selected_agent_fallback_id") is None
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input record {input_id} has no selected release or agent fallback.",
+            )
+        if req.use_agent and not service.has_agent_fallback():
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini agent fallback is not configured or disabled.",
+            )
+        if repo.has_active_queue_item(input_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Input record {input_id} already has an active queued/running job.",
+            )
+
+        label = (
+            f"Enrich #{input_id}: {rec['album_artist_raw']} - {rec['album_title_raw']}"
+        ).strip()
+        job = repo.create_queue_job(
+            job_type="track_enrich",
+            label=label,
+            items=[
+                {
+                    "row_number": 1,
+                    "input_id": input_id,
+                    "barcode": rec["barcode_raw"],
+                    "album_title": rec["album_title_raw"],
+                    "album_artist": rec["album_artist_raw"],
+                    "force_refresh": req.force_refresh,
+                    "mode": "enrich",
+                    "stage": "queued_enrich",
+                    "status_message": "Queued for track enrichment",
+                    "context_json": {
+                        "use_agent": req.use_agent,
+                        "force_refresh": req.force_refresh,
+                        "result_status": latest["status"],
+                        "result_source": latest["source"],
+                    },
+                }
+            ],
+            force_refresh=req.force_refresh,
+        )
+        qm.notify_enrich()
+        detail = repo.get_queue_job(job.id)
+        assert detail is not None
+        return detail
+
+    @app.post("/jobs/enrich-missing", status_code=202, response_model=QueueJobOut)
+    def enqueue_enrich_missing(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        payload: EnrichRequest | None = Body(default=None),
+    ) -> QueueJobOut:
+        req = payload or EnrichRequest()
+        repo: PipelineRepository = request.app.state.repo
+        service: LookupService = request.app.state.service
+        qm: QueueManager = request.app.state.queue_manager
+
+        if req.use_agent and not service.has_agent_fallback():
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini agent fallback is not configured or disabled.",
+            )
+
+        records = repo.list_matched_inputs_with_missing_track_data(
+            limit=limit, force_refresh=req.force_refresh
+        )
+        items = [
+            {
+                "row_number": idx,
+                "input_id": int(rec["id"]),
+                "barcode": rec["barcode_raw"],
+                "album_title": rec["album_title_raw"],
+                "album_artist": rec["album_artist_raw"],
+                "force_refresh": req.force_refresh,
+                "mode": "enrich",
+                "stage": "queued_enrich",
+                "status_message": "Queued for track enrichment",
+                "context_json": {
+                    "use_agent": req.use_agent,
+                    "force_refresh": req.force_refresh,
+                    "result_status": rec["latest_status"],
+                    "result_source": rec["latest_source"],
+                },
+            }
+            for idx, rec in enumerate(records, start=1)
+        ]
+        job = repo.create_queue_job(
+            job_type="track_enrich",
+            label=f"Enrich missing ({len(items)} records)",
+            items=items,
+            force_refresh=req.force_refresh,
+        )
+        if items:
+            qm.notify_enrich()
+        return job
+
+    @app.post("/records/{input_id}/enrich", response_model=EnrichRecordResponse)
+    def enrich_record_sync(
+        input_id: int,
+        request: Request,
+        payload: EnrichRequest | None = Body(default=None),
+    ) -> EnrichRecordResponse:
+        req = payload or EnrichRequest()
+        service: LookupService = request.app.state.service
+        if req.use_agent and not service.has_agent_fallback():
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini agent fallback is not configured or disabled.",
+            )
+        try:
+            res = service.enrich_record(
+                input_id, use_agent=req.use_agent, force_refresh=req.force_refresh
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if res is None:
+            raise HTTPException(status_code=404, detail=f"Input record {input_id} not found.")
+        return res
 
     @app.get("/jobs/status", response_model=QueueStatusOut)
     def get_queue_status(request: Request) -> QueueStatusOut:

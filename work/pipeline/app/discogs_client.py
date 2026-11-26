@@ -197,3 +197,12 @@ class DiscogsClient:
         return self._request_json(
             f"/releases/{release_id}", params=None, bypass_cache=bypass_cache
         )
+
+    def get_master_versions(
+        self, master_id: int, per_page: int = 25, bypass_cache: bool = False
+    ) -> tuple[dict[str, Any], bool]:
+        return self._request_json(
+            f"/masters/{master_id}/versions",
+            params={"per_page": per_page},
+            bypass_cache=bypass_cache,
+        )

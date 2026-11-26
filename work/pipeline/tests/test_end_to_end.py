@@ -67,7 +67,9 @@ def _cleanup_test_rows(baseline_cache_keys: set[str] | None = None) -> None:
                        OR barcode_raw LIKE '0999000%'
                     """
                 )
-                cur.execute("DELETE FROM releases WHERE discogs_release_id >= 9900000")
+                cur.execute(
+                    "DELETE FROM releases WHERE discogs_release_id BETWEEN 9900000 AND 9999999 OR title LIKE '__test_%'"
+                )
                 if baseline_cache_keys is not None:
                     cur.execute("SELECT cache_key FROM api_cache")
                     for (key,) in cur.fetchall():

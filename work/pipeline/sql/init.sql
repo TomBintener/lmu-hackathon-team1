@@ -40,8 +40,12 @@ CREATE TABLE IF NOT EXISTS releases (
     tracklist_hash TEXT NOT NULL DEFAULT '',
     unscoped_credits_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     raw_json JSONB NOT NULL,
+    source_provider TEXT NOT NULL DEFAULT 'discogs',
     fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE releases
+    ADD COLUMN IF NOT EXISTS source_provider TEXT NOT NULL DEFAULT 'discogs';
 
 CREATE INDEX IF NOT EXISTS idx_releases_artist_title ON releases (artist_norm, title_norm);
 CREATE INDEX IF NOT EXISTS idx_releases_tracklist_hash ON releases (tracklist_hash);
@@ -236,3 +240,63 @@ CREATE TABLE IF NOT EXISTS queue_items (
 CREATE INDEX IF NOT EXISTS idx_queue_items_stage_id ON queue_items (stage, id ASC);
 CREATE INDEX IF NOT EXISTS idx_queue_items_job_row ON queue_items (job_id, row_number ASC);
 CREATE INDEX IF NOT EXISTS idx_queue_items_input_stage ON queue_items (input_id, stage);
+
+-- Track enrichment & provenance migrations (idempotent for existing pgdata volumes)
+ALTER TABLE releases
+    ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMPTZ;
+
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS isrc TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS isrc_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS isrc_source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS duration_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS duration_source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS performer_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS performer_source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE tracks
+    ADD COLUMN IF NOT EXISTS enrichment_notes_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE track_credits
+    ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE agent_fallbacks
+    ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMPTZ;
+
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS performing_artists_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS performing_artist_display TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS has_resolved_performer BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS isrc TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS isrc_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS isrc_source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS duration_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS duration_source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS performer_source TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS performer_source_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS credits_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agent_fallback_tracks
+    ADD COLUMN IF NOT EXISTS enrichment_notes_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE releases
+    ADD COLUMN IF NOT EXISTS enrichment_input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases
+    ADD COLUMN IF NOT EXISTS enrichment_output_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases
+    ADD COLUMN IF NOT EXISTS enrichment_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0;
+

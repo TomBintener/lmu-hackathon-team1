@@ -11,7 +11,10 @@ from app import cli
 from app.agent_client import AgentAnswer, AgentFallbackError, AgentTrack
 from app.config import Settings, get_settings
 from app.discogs_client import DiscogsRateLimitError
+from app.extractor import ExtractedRelease, extract_release
+from app.fallback_providers import make_fallback_release_id
 from app.main import create_app
+from app.models import NormalizedInput
 from tests.conftest import make_sample_release
 from tests.test_end_to_end import FakeCatalogProvider, _cleanup_test_rows, _get_cache_keys
 
@@ -423,3 +426,124 @@ def test_batch_csv_and_cli_mixed_discogs_and_agent_fallback(
     )
     assert code_404 == 1
     capsys.readouterr()
+
+
+class FakeExternalFallbackProvider:
+    def __init__(self, name: str = "jpc") -> None:
+        self.name = name
+        self.calls: list[str] = []
+        self.releases_by_title: dict[str, tuple[ExtractedRelease, str]] = {}
+
+    def lookup_candidates(
+        self, norm: NormalizedInput, bypass_cache: bool = False
+    ) -> tuple[list[tuple[ExtractedRelease, str]], list[dict[str, Any]], bool]:
+        self.calls.append(norm.title_clean)
+        entry = self.releases_by_title.get(norm.title_clean)
+        queries = [
+            {
+                "tier": f"fallback_{self.name}_test",
+                "params": {"title": norm.title_clean},
+                "result_count": 1 if entry else 0,
+                "from_cache": False,
+            }
+        ]
+        return ([entry] if entry else []), queries, False
+
+    def close(self) -> None:
+        return None
+
+
+def test_external_fallback_sits_between_discogs_and_gemini_agent() -> None:
+    baseline_keys = _get_cache_keys()
+    _cleanup_test_rows(baseline_keys)
+    provider = FakeCatalogProvider()
+    agent = FakeAgentProvider()
+    ext_fb = FakeExternalFallbackProvider(name="jpc")
+
+    neg_id = make_fallback_release_id("jpc", "test-jpc-1")
+    raw_fb = make_sample_release(
+        release_id=neg_id,
+        title="__test_ext_fallback_hit",
+        artist="Fallback Band",
+        barcode="9990007771111",
+    )
+    raw_fb["_source_provider"] = "jpc"
+    raw_fb["uri"] = "https://www.jpc.de/jpcng/poprock/detail/-/art/test/hnum/1"
+    ext_fb.releases_by_title["__test_ext_fallback_hit"] = (extract_release(raw_fb), "jpc_ean")
+
+    agent.responses_by_title["__test_ext_fallback_miss"] = AgentAnswer(
+        tracks=[AgentTrack(disc=1, number=1, title="Agent Rescued Track", length_sec=190)],
+        sources=["https://petzold.example/release"],
+    )
+
+    settings = Settings(
+        database_url=get_settings().database_url,
+        enable_agent_fallback=True,
+        enable_external_fallbacks=True,
+        gemini_api_key="test-gemini-key",
+        enable_queue_workers=False,
+    )
+    app = create_app(
+        settings=settings,
+        provider=provider,
+        agent_provider=agent,
+        fallback_providers=[ext_fb],
+    )
+    try:
+        with TestClient(app) as client:
+            # Case A: Discogs misses -> JPC fallback resolves -> Gemini Agent NOT called
+            r1 = client.post(
+                "/lookup",
+                json={
+                    "barcode": "9990007771111",
+                    "album_title": "__test_ext_fallback_hit",
+                    "album_artist": "Fallback Band",
+                },
+            )
+            assert r1.status_code == 200
+            b1 = r1.json()
+            assert b1["status"] == "matched"
+            assert b1["source"] == "jpc_live"
+            assert b1["fallback_used"] is True
+            assert b1["release"]["discogs_release_id"] == neg_id
+            assert b1["agent_result"] is None
+            assert len(ext_fb.calls) == 1
+            assert len(agent.calls) == 0
+
+            # Second lookup hits Layer 1 PostgreSQL DB cache
+            r1_cached = client.post(
+                "/lookup",
+                json={
+                    "barcode": "9990007771111",
+                    "album_title": "__test_ext_fallback_hit",
+                    "album_artist": "Fallback Band",
+                },
+            )
+            assert r1_cached.status_code == 200
+            assert r1_cached.json()["source"] == "database"
+            assert len(agent.calls) == 0
+
+            # Dashboard renders friendly JPC label instead of negative ID
+            dash_html = client.get("/results").text
+            assert ">JPC<" in dash_html
+
+            # Case B: Discogs & external fallback miss -> escalates to Gemini Agent
+            r2 = client.post(
+                "/lookup",
+                json={
+                    "barcode": "",
+                    "album_title": "__test_ext_fallback_miss",
+                    "album_artist": "Rare Band",
+                },
+            )
+            assert r2.status_code == 200
+            b2 = r2.json()
+            assert b2["source"] == "gemini_agent"
+            assert b2["agent_result"] is not None
+            assert len(agent.calls) == 1
+            detail = client.get(f"/records/{b2['input_id']}").json()
+            tiers = [q.get("tier") for q in detail["runs"][0]["queries_attempted_json"]]
+            assert "fallback_jpc_test" in tiers
+            assert "agent_fallback" in tiers
+    finally:
+        _cleanup_test_rows(baseline_keys)

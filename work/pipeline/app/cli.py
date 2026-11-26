@@ -7,9 +7,16 @@ from typing import Any
 
 from psycopg_pool import ConnectionPool
 
-from app.agent_client import AgentFallbackProvider, GeminiAgentClient
+from app.agent_client import (
+    AgentFallbackProvider,
+    AzureOpenAIAgentClient,
+    GeminiAgentClient,
+    build_agent_client,
+)
 from app.config import Settings, get_settings
 from app.discogs_client import CatalogProvider, DiscogsClient
+from app.enricher import TrackEnricher, build_default_track_enricher
+from app.fallback_providers import FallbackProvider, build_default_fallback_providers
 from app.models import BatchRequest, LookupNotFoundResponse, LookupRequest
 from app.repository import PipelineRepository
 from app.service import LookupService, UpstreamServiceError
@@ -26,6 +33,8 @@ def main(
     provider: CatalogProvider | None = None,
     agent_provider: AgentFallbackProvider | None = None,
     settings: Settings | None = None,
+    fallback_providers: list[FallbackProvider] | None = None,
+    enricher: TrackEnricher | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description="Discogs tracklist discovery CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -76,6 +85,34 @@ def main(
         help="Enqueue all eligible not_found records for Gemini agent retry",
     )
 
+    enrich_cmd = sub.add_parser(
+        "enrich",
+        help="Synchronously enrich missing track metadata for matched records",
+    )
+    enrich_cmd.add_argument("--input-id", type=int, default=None, help="Specific input_id to enrich")
+    enrich_cmd.add_argument(
+        "--all-missing",
+        action="store_true",
+        help="Enrich all matched/needs_review records with missing track data",
+    )
+    enrich_cmd.add_argument("--limit", type=int, default=100, help="Max records for --all-missing")
+    enrich_cmd.add_argument("--use-agent", action="store_true", help="Allow Tier 3 Gemini search")
+    enrich_cmd.add_argument("--refresh", action="store_true", help="Bypass api_cache & enriched_at")
+
+    enq_enrich = sub.add_parser(
+        "enqueue-enrich",
+        help="Enqueue async track enrichment job(s) into PostgreSQL queue_jobs",
+    )
+    enq_enrich.add_argument("--input-id", type=int, default=None, help="Specific input_id to enrich")
+    enq_enrich.add_argument(
+        "--all-missing",
+        action="store_true",
+        help="Enqueue all matched/needs_review records with missing track data",
+    )
+    enq_enrich.add_argument("--limit", type=int, default=100, help="Max records for --all-missing")
+    enq_enrich.add_argument("--use-agent", action="store_true", help="Allow Tier 3 Gemini search")
+    enq_enrich.add_argument("--refresh", action="store_true", help="Bypass api_cache & enriched_at")
+
     args = parser.parse_args(argv)
     cfg = settings or get_settings()
     pool = ConnectionPool(conninfo=cfg.database_url, min_size=1, max_size=5, open=True)
@@ -87,17 +124,42 @@ def main(
         own_client = DiscogsClient(cfg, cache_store=repo)
         active_provider = own_client
 
-    own_agent_client: GeminiAgentClient | None = None
+    own_agent_client: GeminiAgentClient | AzureOpenAIAgentClient | None = None
     active_agent_provider = agent_provider
-    if active_agent_provider is None and cfg.is_agent_configured():
-        own_agent_client = GeminiAgentClient(cfg)
+    if active_agent_provider is None:
+        own_agent_client = build_agent_client(cfg)
         active_agent_provider = own_agent_client
+
+    own_fallbacks: list[FallbackProvider] = []
+    if fallback_providers is not None:
+        active_fallbacks = list(fallback_providers)
+    elif provider is None:
+        own_fallbacks = build_default_fallback_providers(cfg, cache_store=repo)
+        active_fallbacks = own_fallbacks
+    else:
+        active_fallbacks = []
+
+    own_enricher: TrackEnricher | None = None
+    if enricher is not None:
+        active_enricher: TrackEnricher | None = enricher
+    elif provider is None and cfg.enable_track_enrichment:
+        own_enricher = build_default_track_enricher(
+            cfg,
+            active_provider,
+            cache_store=repo,
+            agent_provider=active_agent_provider,
+        )
+        active_enricher = own_enricher
+    else:
+        active_enricher = None
 
     service = LookupService(
         repo=repo,
         provider=active_provider,
         settings=cfg,
         agent_provider=active_agent_provider,
+        fallback_providers=active_fallbacks,
+        enricher=active_enricher,
     )
 
     try:
@@ -209,7 +271,138 @@ def main(
             )
             print(json.dumps(job.model_dump(), indent=2, ensure_ascii=False))
             return 0
+
+        if args.command == "enrich":
+            if args.input_id is None and not args.all_missing:
+                print(
+                    json.dumps({"error": "Specify --input-id <ID> or --all-missing."}),
+                    file=sys.stderr,
+                )
+                return 2
+            if args.use_agent and not service.has_agent_fallback():
+                print(
+                    json.dumps({"error": "Gemini agent fallback is not configured or disabled."}),
+                    file=sys.stderr,
+                )
+                return 2
+            if args.input_id is not None:
+                try:
+                    res = service.enrich_record(
+                        args.input_id,
+                        use_agent=args.use_agent,
+                        force_refresh=args.refresh,
+                    )
+                except ValueError as exc:
+                    print(json.dumps({"error": str(exc)}), file=sys.stderr)
+                    return 2
+                if res is None:
+                    print(
+                        json.dumps({"error": f"Input record {args.input_id} not found."}),
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(json.dumps(res.model_dump(), indent=2, ensure_ascii=False))
+                return 0
+            batch_res = service.enrich_missing_records(
+                limit=args.limit,
+                use_agent=args.use_agent,
+                force_refresh=args.refresh,
+            )
+            print(json.dumps(batch_res.model_dump(), indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "enqueue-enrich":
+            if args.input_id is None and not args.all_missing:
+                print(
+                    json.dumps({"error": "Specify --input-id <ID> or --all-missing."}),
+                    file=sys.stderr,
+                )
+                return 2
+            if args.use_agent and not service.has_agent_fallback():
+                print(
+                    json.dumps({"error": "Gemini agent fallback is not configured or disabled."}),
+                    file=sys.stderr,
+                )
+                return 2
+            if args.input_id is not None:
+                rec = repo.get_input_record(args.input_id)
+                if rec is None:
+                    print(
+                        json.dumps({"error": f"Input record {args.input_id} not found."}),
+                        file=sys.stderr,
+                    )
+                    return 1
+                latest = repo.find_latest_run(args.input_id)
+                if latest is None or latest["status"] not in ("matched", "needs_review"):
+                    print(
+                        json.dumps(
+                            {
+                                "error": f"Input record {args.input_id} has no matched/needs_review result."
+                            }
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 2
+                items = [
+                    {
+                        "row_number": 1,
+                        "input_id": args.input_id,
+                        "barcode": rec["barcode_raw"],
+                        "album_title": rec["album_title_raw"],
+                        "album_artist": rec["album_artist_raw"],
+                        "force_refresh": args.refresh,
+                        "mode": "enrich",
+                        "stage": "queued_enrich",
+                        "status_message": "Queued for track enrichment",
+                        "context_json": {
+                            "use_agent": args.use_agent,
+                            "force_refresh": args.refresh,
+                            "result_status": latest["status"],
+                            "result_source": latest["source"],
+                        },
+                    }
+                ]
+                label = (
+                    f"Enrich #{args.input_id}: {rec['album_artist_raw']} - {rec['album_title_raw']}"
+                ).strip()
+            else:
+                records = repo.list_matched_inputs_with_missing_track_data(
+                    limit=args.limit, force_refresh=args.refresh
+                )
+                items = [
+                    {
+                        "row_number": idx,
+                        "input_id": int(rec["id"]),
+                        "barcode": rec["barcode_raw"],
+                        "album_title": rec["album_title_raw"],
+                        "album_artist": rec["album_artist_raw"],
+                        "force_refresh": args.refresh,
+                        "mode": "enrich",
+                        "stage": "queued_enrich",
+                        "status_message": "Queued for track enrichment",
+                        "context_json": {
+                            "use_agent": args.use_agent,
+                            "force_refresh": args.refresh,
+                            "result_status": rec["latest_status"],
+                            "result_source": rec["latest_source"],
+                        },
+                    }
+                    for idx, rec in enumerate(records, start=1)
+                ]
+                label = f"Enrich missing ({len(items)} records)"
+            job = repo.create_queue_job(
+                job_type="track_enrich",
+                label=label,
+                items=items,
+                force_refresh=args.refresh,
+            )
+            print(json.dumps(job.model_dump(), indent=2, ensure_ascii=False))
+            return 0
     finally:
+        if own_enricher is not None:
+            own_enricher.close()
+        for fb in own_fallbacks:
+            fb.close()
         if own_agent_client is not None:
             own_agent_client.close()
         if own_client is not None:

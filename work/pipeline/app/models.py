@@ -56,6 +56,7 @@ class TrackCreditOut(BaseModel):
     role_raw: str
     role_category: str
     credit_source: str
+    source_url: str = ""
 
 
 class TrackOut(BaseModel):
@@ -72,6 +73,14 @@ class TrackOut(BaseModel):
     performing_artist_display: str = ""
     has_valid_duration: bool = False
     has_resolved_performer: bool = False
+    isrc: str = ""
+    isrc_source: str = ""
+    isrc_source_url: str = ""
+    duration_source: str = ""
+    duration_source_url: str = ""
+    performer_source: str = ""
+    performer_source_url: str = ""
+    enrichment_notes: list[str] = Field(default_factory=list)
     credits: dict[str, list[TrackCreditOut]] = Field(
         default_factory=lambda: {
             "composers": [],
@@ -178,6 +187,12 @@ class BatchRequest(BaseModel):
     output_path: str = "/app/outputs/batch_report.json"
 
 
+class RestartDemoRequest(BaseModel):
+    csv_path: str = "/app/data/development.csv"
+    output_path: str = "/app/outputs/dev25_enriched.json"
+    clear_api_cache: bool = False
+
+
 class BatchRowOutcome(BaseModel):
     row_number: int
     barcode: str
@@ -197,6 +212,8 @@ class BatchRowOutcome(BaseModel):
     duration_coverage: float | None = None
     performer_coverage: float | None = None
     writer_credit_coverage: float | None = None
+    producer_credit_coverage: float | None = None
+    isrc_coverage: float | None = None
     review_reasons: list[str] = Field(default_factory=list)
     rejection_reasons: list[str] = Field(default_factory=list)
     error_detail: str | None = None
@@ -340,6 +357,8 @@ class QueueStageCountsOut(BaseModel):
     checking_discogs: int = 0
     queued_agent: int = 0
     checking_agent: int = 0
+    queued_enrich: int = 0
+    checking_enrich: int = 0
 
 
 class QueueStatusOut(BaseModel):
@@ -349,5 +368,49 @@ class QueueStatusOut(BaseModel):
     recent_jobs: list[QueueJobOut] = Field(default_factory=list)
     discogs_workers: int = 0
     agent_workers: int = 0
+    enrich_workers: int = 0
     workers_running: bool = False
     agent_configured: bool = False
+    idle_auto_enrichment_enabled: bool = False
+
+
+class EnrichRequest(BaseModel):
+    use_agent: bool = False
+    force_refresh: bool = False
+
+
+class EnrichRecordResponse(BaseModel):
+    input_id: int
+    target_type: Literal["release", "agent_fallback"]
+    target_id: int
+    tracks_total: int
+    durations_filled: int = 0
+    performers_filled: int = 0
+    credits_added: int = 0
+    isrcs_filled: int = 0
+    duration_coverage_before: float
+    duration_coverage_after: float
+    performer_coverage_before: float
+    performer_coverage_after: float
+    writer_credit_coverage_before: float = 0.0
+    writer_credit_coverage_after: float = 0.0
+    producer_credit_coverage_before: float = 0.0
+    producer_credit_coverage_after: float = 0.0
+    providers_used: list[str] = Field(default_factory=list)
+    agent_input_tokens: int = 0
+    agent_output_tokens: int = 0
+    agent_cost_usd: float = 0.0
+    remaining_missing_duration: int = 0
+    remaining_missing_performer: int = 0
+    tracks: list[TrackOut] = Field(default_factory=list)
+
+
+class BatchEnrichResponse(BaseModel):
+    records_checked: int
+    records_enriched: int
+    total_durations_filled: int = 0
+    total_performers_filled: int = 0
+    total_credits_added: int = 0
+    total_isrcs_filled: int = 0
+    total_agent_cost_usd: float = 0.0
+    outcomes: list[EnrichRecordResponse] = Field(default_factory=list)

@@ -15,7 +15,10 @@ from psycopg_pool import ConnectionPool
 from app import cli
 from app.agent_client import AgentAnswer, AgentTrack
 from app.config import Settings, get_settings
+from app.extractor import ExtractedRelease, extract_release
+from app.fallback_providers import make_fallback_release_id
 from app.main import create_app
+from app.models import NormalizedInput
 from app.repository import PipelineRepository
 from tests.conftest import make_sample_release
 from tests.test_end_to_end import FakeCatalogProvider
@@ -616,5 +619,263 @@ def test_cli_enqueue_batch_and_retry_not_found(
         assert retry_payload["job_type"] == "agent_retry"
         assert retry_payload["total_items"] == 1
         assert retry_payload["status"] == "queued"
+    finally:
+        _truncate_test_db(queue_test_db_url)
+
+
+class _QueueFakeExternalFallback:
+    name = "itunes"
+
+    def __init__(self, releases_by_title: dict[str, tuple[ExtractedRelease, str]]) -> None:
+        self.calls: list[str] = []
+        self._releases = releases_by_title
+
+    def lookup_candidates(
+        self, norm: NormalizedInput, bypass_cache: bool = False
+    ) -> tuple[list[tuple[ExtractedRelease, str]], list[dict[str, Any]], bool]:
+        self.calls.append(norm.title_clean)
+        hit = self._releases.get(norm.title_clean)
+        queries = [
+            {
+                "tier": "fallback_itunes_test",
+                "params": {"title": norm.title_clean},
+                "result_count": 1 if hit else 0,
+                "from_cache": False,
+            }
+        ]
+        return ([hit] if hit else []), queries, False
+
+    def close(self) -> None:
+        return None
+
+
+def test_queue_runs_external_fallback_between_discogs_and_agent(
+    queue_test_db_url: str, tmp_path: Path
+) -> None:
+    _truncate_test_db(queue_test_db_url)
+    provider = ControllableCatalogProvider()
+    agent = ControllableAgentProvider()
+
+    neg_id = make_fallback_release_id("itunes", "6798000134")
+    raw_itunes = make_sample_release(
+        release_id=neg_id,
+        title="__test_q_ext_hit",
+        artist="Queue Indie Artist",
+        barcode="",
+        notes="",
+    )
+    raw_itunes["_source_provider"] = "itunes"
+    raw_itunes["uri"] = "https://music.apple.com/de/album/test/6798000134"
+    ext_fb = _QueueFakeExternalFallback(
+        {"__test_q_ext_hit": (extract_release(raw_itunes), "itunes_search")}
+    )
+
+    agent.responses_by_title["__test_q_ext_miss"] = AgentAnswer(
+        tracks=[AgentTrack(disc=1, number=1, title="Agent Only Track", length_sec=160)],
+        sources=["https://petzold.example/album"],
+    )
+
+    settings = Settings(
+        database_url=queue_test_db_url,
+        enable_agent_fallback=True,
+        enable_external_fallbacks=True,
+        gemini_api_key="test-gemini-key",
+        enable_queue_workers=True,
+        discogs_queue_concurrency=1,
+        agent_queue_concurrency=1,
+        queue_poll_interval_sec=0.05,
+    )
+    app = create_app(
+        settings=settings,
+        provider=provider,
+        agent_provider=agent,
+        fallback_providers=[ext_fb],
+    )
+    try:
+        with TestClient(app) as client:
+            csv_file = tmp_path / "q_mid_fallback.csv"
+            with csv_file.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["barcode", "album_title", "album_artist"])
+                writer.writerow(["", "__test_q_ext_hit", "Queue Indie Artist"])
+                writer.writerow(["", "__test_q_ext_miss", "Queue Agent Artist"])
+
+            out_json = tmp_path / "q_mid_report.json"
+            enq = client.post(
+                "/jobs/batch",
+                json={"csv_path": str(csv_file), "output_path": str(out_json)},
+            )
+            assert enq.status_code == 202
+            job_id = enq.json()["id"]
+
+            detail = _wait_until(
+                lambda: (
+                    d
+                    if (d := client.get(f"/jobs/{job_id}").json())["job"]["status"]
+                    == "completed"
+                    else None
+                )
+            )
+            job = detail["job"]
+            assert job["matched_count"] == 1
+            assert job["needs_review_count"] == 1
+            assert job["agent_recovered_count"] == 1
+            assert len(ext_fb.calls) == 2
+            assert len(agent.calls) == 1
+            assert agent.calls[0]["album"] == "__test_q_ext_miss"
+
+            items = detail["items"]
+            assert items[0]["result_source"] == "itunes_live"
+            assert items[0]["selected_release_id"] == neg_id
+            assert items[0]["selected_agent_fallback_id"] is None
+            assert items[1]["result_source"] == "gemini_agent"
+            assert items[1]["selected_agent_fallback_id"] is not None
+
+            report = json.loads(out_json.read_text(encoding="utf-8"))
+            assert report["summary"]["outcomes"][0]["fallback_used"] is True
+            assert report["summary"]["outcomes"][0]["source"] == "itunes_live"
+    finally:
+        _truncate_test_db(queue_test_db_url)
+
+
+def test_restart_demo_resets_db_preserves_or_clears_cache_and_queues_csv(
+    queue_test_db_url: str, tmp_path: Path
+) -> None:
+    _truncate_test_db(queue_test_db_url)
+    provider = ControllableCatalogProvider()
+    provider.search_by_tier_or_key = [
+        ({"barcode": "9990006001111"}, [{"id": 9900601}]),
+        ({"barcode": "9990006002222"}, [{"id": 9900602}]),
+        ({"barcode": "9990006003333"}, [{"id": 9900603}]),
+    ]
+    provider.releases[9900601] = make_sample_release(
+        release_id=9900601,
+        title="__test_restart_old",
+        artist="Old Band",
+        barcode="9990006001111",
+    )
+    provider.releases[9900602] = make_sample_release(
+        release_id=9900602,
+        title="__test_restart_song_1",
+        artist="New Band 1",
+        barcode="9990006002222",
+    )
+    provider.releases[9900603] = make_sample_release(
+        release_id=9900603,
+        title="__test_restart_song_2",
+        artist="New Band 2",
+        barcode="9990006003333",
+    )
+
+    csv_file = tmp_path / "restart_demo.csv"
+    with csv_file.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["barcode", "album_title", "album_artist"])
+        writer.writerow(["9990006002222", "__test_restart_song_1", "New Band 1"])
+        writer.writerow(["9990006003333", "__test_restart_song_2", "New Band 2"])
+    out_json = tmp_path / "restart_out.json"
+
+    settings = Settings(
+        database_url=queue_test_db_url,
+        enable_agent_fallback=False,
+        enable_queue_workers=True,
+        discogs_queue_concurrency=1,
+        queue_poll_interval_sec=0.05,
+        enable_idle_auto_enrichment=False,
+    )
+    app = create_app(settings=settings, provider=provider)
+    try:
+        with TestClient(app) as client:
+            # 1. Seed initial record, completed queue job, and api_cache entry
+            seed = client.post(
+                "/jobs/lookup",
+                json={
+                    "barcode": "9990006001111",
+                    "album_title": "__test_restart_old",
+                    "album_artist": "Old Band",
+                    "mode": "full",
+                },
+            )
+            assert seed.status_code == 202
+            seed_jid = seed.json()["job"]["id"]
+            _wait_until(
+                lambda: client.get(f"/jobs/{seed_jid}").json()["job"]["status"]
+                == "completed"
+            )
+            app.state.repo.set_api_cache(
+                "restart-sentinel-key", "/sentinel", 200, {"ok": True}
+            )
+
+            # Missing CSV must fail 404 before wiping DB or cache
+            missing_res = client.post(
+                "/jobs/restart-demo",
+                json={"csv_path": str(tmp_path / "does_not_exist.csv")},
+            )
+            assert missing_res.status_code == 404
+            assert len(client.get("/records").json()) == 1
+            assert app.state.repo.get_api_cache("restart-sentinel-key") is not None
+
+            # Verify UI renders Restart controls on both /results and /queue
+            res_html = client.get("/results").text
+            queue_html = client.get("/queue").text
+            for html_text in (res_html, queue_html):
+                assert "Restart 25 Songs" in html_text
+                assert "restartDemo()" in html_text
+                assert "restartClearCache" in html_text
+
+            # 2. Restart preserving api_cache (default demo mode)
+            restart_keep = client.post(
+                "/jobs/restart-demo",
+                json={
+                    "csv_path": str(csv_file),
+                    "output_path": str(out_json),
+                    "clear_api_cache": False,
+                },
+            )
+            assert restart_keep.status_code == 202
+            keep_job = restart_keep.json()
+            assert keep_job["id"] == 1
+            assert keep_job["total_items"] == 2
+
+            done_keep = _wait_until(
+                lambda: (
+                    d
+                    if (d := client.get("/jobs/1").json())["job"]["status"]
+                    == "completed"
+                    else None
+                )
+            )
+            assert done_keep["job"]["completed_items"] == 2
+            assert done_keep["job"]["matched_count"] == 2
+            assert done_keep["job"]["error_count"] == 0
+            assert out_json.exists()
+
+            recs_after = client.get("/records").json()
+            titles = {r["album_title_raw"] for r in recs_after}
+            assert titles == {"__test_restart_song_1", "__test_restart_song_2"}
+            assert "__test_restart_old" not in titles
+            assert app.state.repo.get_api_cache("restart-sentinel-key") is not None
+
+            # 3. Restart with clear_api_cache=True wipes api_cache too
+            restart_wipe = client.post(
+                "/jobs/restart-demo",
+                json={
+                    "csv_path": str(csv_file),
+                    "output_path": str(out_json),
+                    "clear_api_cache": True,
+                },
+            )
+            assert restart_wipe.status_code == 202
+            assert restart_wipe.json()["id"] == 1
+            done_wipe = _wait_until(
+                lambda: (
+                    d
+                    if (d := client.get("/jobs/1").json())["job"]["status"]
+                    == "completed"
+                    else None
+                )
+            )
+            assert done_wipe["job"]["completed_items"] == 2
+            assert app.state.repo.get_api_cache("restart-sentinel-key") is None
     finally:
         _truncate_test_db(queue_test_db_url)
